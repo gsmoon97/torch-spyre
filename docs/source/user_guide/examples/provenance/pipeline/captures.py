@@ -347,9 +347,10 @@ def capture():
 
     # ---- Stage 6 exact output dirs ---------------------------------------
     def _get_output_dir(original):
-        def wrapper(kernel_name):
-            out = original(kernel_name)
+        def wrapper(*args, **kwargs):
+            out = original(*args, **kwargs)
             try:
+                kernel_name = args[0] if args else kwargs.get("kernel_name")
                 results["stage6_kernels"]["output_dirs"][kernel_name] = out
             except Exception as e:
                 results["_hooks"]["stage6_output_dir"] = f"error: {e}"

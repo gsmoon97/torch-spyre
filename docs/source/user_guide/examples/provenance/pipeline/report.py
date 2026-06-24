@@ -29,7 +29,7 @@ from typing import Any
 TICK = "✅"  # present on all relevant nodes/ops
 PARTIAL = "◐"  # present on some (shown as n/total)
 CROSS = "❌"  # measured absent
-DASH = "➖"  # n/a: not generated yet, or carried only indirectly (origins)
+DASH = "➖"  # n/a: not generated yet, or carried only indirectly (other fields)
 
 # Field sets, in the order issue #2574 lists them.
 FX_FIELDS = [
@@ -198,7 +198,7 @@ def render(
         f"{PARTIAL} on some (n/total) &nbsp; "
         f"{CROSS} reachable here but measured **empty/absent** &nbsp; "
         f"{DASH} not applicable here (no such slot, or carried indirectly via "
-        "`origins`).",
+        "other fields).",
         "",
         "Every column tests **population** (the field exists *and* carries "
         'non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do '
@@ -213,8 +213,9 @@ def render(
         "inserting `restickify` buffers). These map to issue #2574's "
         '"Inductor passes" → "LoopLevelIR".',
         "",
-        "| Layer | Field | FX pre-grad | FX post-grad | LoopLevelIR (pre-pass) "
-        "| LoopLevelIR (post-pass) | OpSpec | SuperDSC JSON |",
+        "| Layer | Field | FX Graph (pre-grad) | FX Graph (post-grad) "
+        "| LoopLevelIR (pre-pass) | LoopLevelIR (post-pass) | OpSpec "
+        "| SuperDSC JSON |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for f in FX_FIELDS:
@@ -246,7 +247,7 @@ def render(
     # Stage 2 detail ------------------------------------------------------
     for label, nodes in [("pre-grad", pre), ("post-grad", post)]:
         L += [
-            f"## Stage 2 — FX {label} ({len(nodes)} compute nodes)",
+            f"## Stage 2 — FX Graph ({label}): {len(nodes)} compute nodes",
             "",
             "Cell = observed `type` of the field, or ❌ if absent.",
             "",
@@ -307,7 +308,7 @@ def render(
 
     # Stage 5 detail ------------------------------------------------------
     L += [
-        f"## Stage 5 — OpSpec ops ({len(opspec_ops)})",
+        f"## Stage 5 — OpSpec: {len(opspec_ops)} ops",
         "",
         f"`OpSpec` declared fields: `{opspec_fields}` — no provenance field. The "
         "`origins` below are what is *available on the input `ComputedBuffer`* at "
@@ -331,7 +332,8 @@ def render(
 
     # Stage 6 detail ------------------------------------------------------
     L += [
-        f"## Stage 6 — SuperDSC kernels ({len(kernels)})",
+        f"## Stage 6 — SuperDSC: {bundles.get('total_sdsc_files', 0)} "
+        f"`sdsc_*.json` files ({len(kernels)} kernels)",
         "",
         f"Provenance field present in any emitted `sdsc_*.json`: {sdsc_cell}",
         "",

@@ -1,6 +1,6 @@
 # Provenance Audit: `SimpleMLP` — Metadata Across the Compilation Pipeline
 
-> Generated: 2026-06-24 16:08 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
+> Generated: 2026-06-24 19:17 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
 
 Measured in-process during one cache-defeated `torch.compile` (compile-path objects only). This report is **measurement-only**; interpretation is a separate deliverable.
 
@@ -16,13 +16,13 @@ Measured in-process during one cache-defeated `torch.compile` (compile-path obje
 
 ## Stage × Field Matrix
 
-✅ present & non-empty on **all** instances &nbsp; ◐ on some (n/total) &nbsp; ❌ reachable here but measured **empty/absent** &nbsp; ➖ not applicable here (no such slot, or carried indirectly via `origins`).
+✅ present & non-empty on **all** instances &nbsp; ◐ on some (n/total) &nbsp; ❌ reachable here but measured **empty/absent** &nbsp; ➖ not applicable here (no such slot, or carried indirectly via other fields).
 
 Every column tests **population** (the field exists *and* carries non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do not). These cells are measurements only; interpreting each absence is the separate analysis deliverable (`provenance_analysis.md`).
 
 The **Layer** column marks whether a field lives on the FX node (`FX`) or the IR `ComputedBuffer` (`IR`). The two IR columns are the same LoopLevelIR before and after the Spyre pre-scheduling passes: **LoopLevelIR (pre-pass)** is the lowered IR entering them, **LoopLevelIR (post-pass)** is after they mutate it in place (e.g. inserting `restickify` buffers). These map to issue #2574's "Inductor passes" → "LoopLevelIR".
 
-| Layer | Field | FX pre-grad | FX post-grad | LoopLevelIR (pre-pass) | LoopLevelIR (post-pass) | OpSpec | SuperDSC JSON |
+| Layer | Field | FX Graph (pre-grad) | FX Graph (post-grad) | LoopLevelIR (pre-pass) | LoopLevelIR (post-pass) | OpSpec | SuperDSC JSON |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | FX | `stack_trace` | ✅ | ◐ 3/7 | ➖ | ➖ | ➖ | ➖ |
 | FX | `nn_module_stack` | ◐ 2/3 | ◐ 2/7 | ➖ | ➖ | ➖ | ➖ |
@@ -34,17 +34,17 @@ The **Layer** column marks whether a field lives on the FX node (`FX`) or the IR
 | IR | `traceback` | ➖ | ➖ | ❌ | ❌ | ❌ | ❌ |
 | IR | `get_stack_traces` | ➖ | ➖ | ◐ 3/5 | ◐ 3/5 | ❌ | ❌ |
 
-## Stage 2 — FX pre-grad (3 compute nodes)
+## Stage 2 — FX Graph (pre-grad): 3 compute nodes
 
 Cell = observed `type` of the field, or ❌ if absent.
 
 | Node | target | `stack_trace` | `nn_module_stack` | `source_fn_stack` | `original_aten` | `from_node` | source line |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `x` | `<built-in function linear>` | `str` | `dict` | `list` | ❌ | ❌ | `x = self.fc1(x)` |
-| `x_1` | `<built-in method relu of type object at 0x7f655359c8a0>` | `str` | ❌ | `list` | ❌ | ❌ | `x = torch.relu(x)` |
+| `x_1` | `<built-in method relu of type object at 0x7f9edd8058a0>` | `str` | ❌ | `list` | ❌ | ❌ | `x = torch.relu(x)` |
 | `x_2` | `<built-in function linear>` | `str` | `dict` | `list` | ❌ | ❌ | `x = self.fc2(x)` |
 
-## Stage 2 — FX post-grad (7 compute nodes)
+## Stage 2 — FX Graph (post-grad): 7 compute nodes
 
 Cell = observed `type` of the field, or ❌ if absent.
 
@@ -82,7 +82,7 @@ The same IR after the pre-scheduling passes mutate it in place.
 | `op3` | `mm_default`, `permute_1` | `mm_default` | ❌ | ✅ |
 | `op4` | `add_tensor` | `add_tensor` | ❌ | ❌ |
 
-## Stage 5 — OpSpec ops (5)
+## Stage 5 — OpSpec: 5 ops
 
 `OpSpec` declared fields: `['op', 'is_reduction', 'iteration_space', 'args', 'op_info', 'tiled_symbols']` — no provenance field. The `origins` below are what is *available on the input `ComputedBuffer`* at `create_op_spec`; the `OpSpec` object itself declares no field to hold them.
 
@@ -94,7 +94,7 @@ The same IR after the pre-scheduling passes mutate it in place.
 | `batchmatmul` | `op3` | `mm_default`, `permute_1` | `mm_default` |
 | `add` | `op4` | `add_tensor` | `add_tensor` |
 
-## Stage 6 — SuperDSC kernels (2)
+## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (2 kernels)
 
 Provenance field present in any emitted `sdsc_*.json`: ❌
 

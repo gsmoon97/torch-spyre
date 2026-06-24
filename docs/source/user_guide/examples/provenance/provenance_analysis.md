@@ -8,7 +8,7 @@
 > cited source.
 >
 > **⚠️ Specific to one audit run — `provenance_audit.md` Generated:
-> `2026-06-24 16:08`.** That report is regenerated on every run; if its
+> `2026-06-24 19:17`.** That report is regenerated on every run; if its
 > timestamp no longer matches the one above, the counts and findings here may be
 > stale. Re-read against the current `provenance_audit.md` and update this file.
 
@@ -54,11 +54,11 @@ node, derived on demand, or generated fresh):
 ```text
   nn.Module source ── file:line, module tree (ground truth)
         │ Dynamo
-  FX pre-grad ───────── stack_trace, nn_module_stack, source_fn_stack
+  FX Graph (pre-grad) ─ stack_trace, nn_module_stack, source_fn_stack
         │ AOTAutograd: addmm decomposition (linear → permute + mm + add)
         │   • anchor nodes (permute/relu) keep stack_trace/nn_module_stack/source_fn_stack
         │   • synthesized mm/add keep only original_aten   ← partial loss #1
-  FX post-grad ──────── + original_aten (all 7), from_node (3/7, run-dependent)
+  FX Graph (post-grad)  + original_aten (all 7), from_node (3/7, run-dependent)
         │ Inductor lowering → ComputedBuffer.origins
   LoopLevelIR (pre-pass)  origins (5/5), origin_node (5/5) entering the passes
         │            ↓ pre-scheduling passes mutate in place (no restickify this run; 5 ops)
