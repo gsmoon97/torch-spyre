@@ -46,7 +46,8 @@ IR_FIELDS = ["origins", "origin_node", "traceback", "get_stack_traces"]
 # Presence computation (purely from captured data)
 # --------------------------------------------------------------------------
 def _fx_present(node: dict, field: str) -> bool:
-    return node.get("fields", {}).get(field) is not None
+    rec = node.get("fields", {}).get(field)
+    return isinstance(rec, dict) and rec.get("nonempty", False)
 
 
 def _fx_symbol(nodes: list[dict], field: str) -> str:
@@ -68,8 +69,9 @@ def _ir_present(op: dict, field: str) -> bool:
     if field == "origins":
         return bool(v)
     if field == "get_stack_traces":
-        return bool(v) and v != "OrderedSet([])"
-    return v is not None
+        return isinstance(v, dict) and v.get("nonempty", False)
+    # origin_node / traceback: populated == truthy (treat "" / None as absent).
+    return bool(v)
 
 
 def _ir_symbol(ops: list[dict], field: str) -> str:
@@ -84,8 +86,7 @@ def _ir_symbol(ops: list[dict], field: str) -> str:
 
 def _ir_attr_exists(ops: list[dict], field: str) -> bool:
     """Does the provenance attribute even exist on these IR objects? Uses the
-    capture's `attr_exists` (hasattr) record; defaults True for older dumps and
-    for derived accessors like get_stack_traces (not tracked there)."""
+    capture's `attr_exists` (hasattr) record."""
     return any(o.get("attr_exists", {}).get(field, True) for o in ops)
 
 
@@ -99,9 +100,43 @@ def _ir_cell(ops: list[dict], field: str) -> str:
     return _ir_symbol(ops, field)
 
 
+def _sdsc_symbol(bundles: dict, field: str) -> str:
+    """SuperDSC matrix cell for one provenance field, counted across all
+    scanned ``sdsc_*.json`` files (mirrors ``_ir_symbol``: ✓ / ◐ x/n / ✗).
+    Parse-error files have no ``provenance_fields`` and are excluded."""
+    files = [
+        fobj
+        for k in bundles.get("kernels", [])
+        for fobj in k.get("sdsc_files", [])
+        if "provenance_fields" in fobj
+    ]
+    total = len(files)
+    if total == 0:
+        return CROSS
+    present = sum(1 for fobj in files if field in fobj["provenance_fields"])
+    if present == 0:
+        return CROSS
+    return TICK if present == total else f"{PARTIAL} {present}/{total}"
+
+
+def _opspec_symbol(ops: list[dict], field: str, opspec_fields: list[str]) -> str:
+    """OpSpec matrix cell. ✗ if the dataclass declares no such field (the
+    genuine drop); otherwise ✓ / ◐ x,total / ✗ from per-instance population,
+    so a field declared but not populated on every op shows partial."""
+    if field not in opspec_fields:
+        return CROSS
+    total = len(ops)
+    if total == 0:
+        return CROSS
+    present = sum(1 for o in ops if o.get("opspec_present", {}).get(field))
+    if present == 0:
+        return CROSS
+    return TICK if present == total else f"{PARTIAL} {present}/{total}"
+
+
 def _fx_type(node: dict, field: str) -> str:
     rec = node.get("fields", {}).get(field)
-    if rec is None:
+    if not (isinstance(rec, dict) and rec.get("nonempty", False)):
         return CROSS
     return f"`{rec.get('type', '?')}`"
 
@@ -152,25 +187,34 @@ def render(
     # Stage x field matrix ------------------------------------------------
     # Each column is measured on the object that stage produces. The Layer column
     # groups fields by the object they live on: FX = FX-node meta, IR =
-    # ComputedBuffer/LoopLevelIR attributes. "Inductor passes" reads the IR
-    # entering pre-scheduling (before snapshot); "LoopLevelIR" reads it after the
-    # passes (they mutate it in place and insert restickify buffers, 5 -> 7 ops).
+    # ComputedBuffer/LoopLevelIR attributes. The two IR columns are the same
+    # LoopLevelIR before ("pre-pass", the lowered IR) and after ("post-pass") the
+    # Spyre pre-scheduling passes, which may insert restickify buffers and null
+    # origin_node on them. (Issue #2574: "Inductor passes" -> "LoopLevelIR".)
     L += [
         "## Stage × Field Matrix",
         "",
-        f"{TICK} present (all) &nbsp; {PARTIAL} present on some (n/total) &nbsp; "
-        f"{CROSS} present-able here but not carried (a genuine drop, or an "
-        f"empty slot) &nbsp; {DASH} not applicable (not generated yet, or carried "
-        "only indirectly via `origins`).",
+        f"{TICK} present & non-empty on **all** instances &nbsp; "
+        f"{PARTIAL} on some (n/total) &nbsp; "
+        f"{CROSS} reachable here but measured **empty/absent** &nbsp; "
+        f"{DASH} not applicable here (no such slot, or carried indirectly via "
+        "`origins`).",
+        "",
+        "Every column tests **population** (the field exists *and* carries "
+        'non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do '
+        "not). These cells are measurements only; interpreting each absence is "
+        "the separate analysis deliverable (`provenance_analysis.md`).",
         "",
         "The **Layer** column marks whether a field lives on the FX node (`FX`) "
-        "or the IR `ComputedBuffer` (`IR`). *Inductor passes* is the IR entering "
-        "pre-scheduling; *LoopLevelIR* is the same IR after the passes — they "
-        "mutate it in place and insert 2 `restickify` buffers (5 → 7 ops), so "
-        "`origin_node` reads ✅ (5/5) → ◐ 5/7 (nulled on the matmuls).",
+        "or the IR `ComputedBuffer` (`IR`). The two IR columns are the same "
+        "LoopLevelIR before and after the Spyre pre-scheduling passes: "
+        "**LoopLevelIR (pre-pass)** is the lowered IR entering them, "
+        "**LoopLevelIR (post-pass)** is after they mutate it in place (e.g. "
+        "inserting `restickify` buffers). These map to issue #2574's "
+        '"Inductor passes" → "LoopLevelIR".',
         "",
-        "| Layer | Field | FX pre-grad | FX post-grad | Inductor passes "
-        "| LoopLevelIR | OpSpec | SuperDSC JSON |",
+        "| Layer | Field | FX pre-grad | FX post-grad | LoopLevelIR (pre-pass) "
+        "| LoopLevelIR (post-pass) | OpSpec | SuperDSC JSON |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for f in FX_FIELDS:
@@ -191,24 +235,13 @@ def render(
         llir_c = _ir_cell(looplevel, f)
         # OpSpec/JSON have no provenance field, so an IR field present upstream is
         # genuinely not carried there -> ❌ (unless a Phase-2 field is declared).
-        opspec_c = TICK if f in opspec_fields else CROSS
-        sdsc_c = TICK if sdsc_present else CROSS
+        opspec_c = _opspec_symbol(opspec_ops, f, opspec_fields)
+        sdsc_c = _sdsc_symbol(bundles, f)
         L.append(
             f"| IR | `{f}` | {DASH} | {DASH} | {passes_c} | {llir_c} "
             f"| {opspec_c} | {sdsc_c} |"
         )
-    L += [
-        "",
-        f"> {DASH} for FX fields downstream of FX post-grad means the value is "
-        f"carried indirectly — FX-meta is reachable through `origins` (which "
-        f"points back to the FX nodes), not as a direct attribute of the IR "
-        f"objects. The genuine drop is the {TICK}/{PARTIAL} → {CROSS} at OpSpec: "
-        f"the `OpSpec` dataclass declares no provenance field "
-        f"(`{opspec_fields}`), so `origins` and its derivatives are not carried "
-        "into OpSpec or the emitted JSON. `traceback` reads ❌ throughout the IR "
-        "stages — the attribute exists but is never populated (an empty slot).",
-        "",
-    ]
+    L.append("")
 
     # Stage 2 detail ------------------------------------------------------
     for label, nodes in [("pre-grad", pre), ("post-grad", post)]:
@@ -232,40 +265,54 @@ def render(
             )
         L.append("")
 
-    # Stages 3-4 detail ---------------------------------------------------
-    L += [
-        f"## Stages 3–4 — LoopLevelIR operations ({len(looplevel)})",
-        "",
-        "Measured `ComputedBuffer` attributes after the pre-scheduling passes.",
-        "",
-        "| Op | `origins` | `origin_node` | `traceback` | `get_stack_traces` |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    for o in looplevel:
-        fields = o.get("fields", {})
-        origins = (
-            ", ".join(f"`{x['name']}`" for x in (fields.get("origins") or [])) or "—"
-        )
-        onode = fields.get("origin_node") or CROSS
-        tb = fields.get("traceback") or CROSS
-        gst = fields.get("get_stack_traces") or ""
-        gst_cell = TICK if gst and gst != "OrderedSet([])" else CROSS
-        L.append(
-            f"| `{o['name']}` | {origins} "
-            f"| {('`' + onode + '`') if onode != CROSS else CROSS} "
-            f"| {tb if tb == CROSS else '`' + str(tb)[:40] + '`'} | {gst_cell} |"
-        )
-    L.append("")
+    # Stages 3 & 4 detail (pre-pass / post-pass LoopLevelIR) --------------
+    # Shown as two tables because the pre-scheduling passes can change the op
+    # count (e.g. insert restickify buffers), so pre-pass and post-pass may differ.
+    for stage_label, desc, ops_list in [
+        (
+            "Stage 3 — LoopLevelIR (pre-pass)",
+            "The lowered IR entering the Spyre pre-scheduling passes.",
+            passes_before,
+        ),
+        (
+            "Stage 4 — LoopLevelIR (post-pass)",
+            "The same IR after the pre-scheduling passes mutate it in place.",
+            looplevel,
+        ),
+    ]:
+        L += [
+            f"## {stage_label}: {len(ops_list)} operations",
+            "",
+            desc,
+            "",
+            "| Op | `origins` | `origin_node` | `traceback` | `get_stack_traces` |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for o in ops_list:
+            fields = o.get("fields", {})
+            origins = (
+                ", ".join(f"`{x['name']}`" for x in (fields.get("origins") or []))
+                or "—"
+            )
+            onode = fields.get("origin_node") or CROSS
+            tb = fields.get("traceback") or CROSS
+            gst = fields.get("get_stack_traces") or {}
+            gst_cell = TICK if gst.get("nonempty") else CROSS
+            L.append(
+                f"| `{o['name']}` | {origins} "
+                f"| {('`' + onode + '`') if onode != CROSS else CROSS} "
+                f"| {tb if tb == CROSS else '`' + str(tb)[:40] + '`'} | {gst_cell} |"
+            )
+        L.append("")
 
     # Stage 5 detail ------------------------------------------------------
     L += [
         f"## Stage 5 — OpSpec ops ({len(opspec_ops)})",
         "",
-        f"`OpSpec` declared fields: `{opspec_fields}` — no provenance field, so "
-        "the matrix shows `OpSpec` as ➖. The `origins` below are what is "
-        "*available on the input `ComputedBuffer`* at `create_op_spec` (what a "
-        "Phase-2 `debug_handle` could capture); the `OpSpec` object itself stores "
-        "none of them.",
+        f"`OpSpec` declared fields: `{opspec_fields}` — no provenance field. The "
+        "`origins` below are what is *available on the input `ComputedBuffer`* at "
+        "`create_op_spec`; the `OpSpec` object itself declares no field to hold "
+        "them.",
         "",
         "| Spyre op | buffer | `origins` | `origin_node` |",
         "| --- | --- | --- | --- |",

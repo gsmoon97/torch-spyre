@@ -394,3 +394,6 @@ test/*.json
 
 .*env*
 stubs
+
+# provenance audit outputs
+provenance_capture_raw.json

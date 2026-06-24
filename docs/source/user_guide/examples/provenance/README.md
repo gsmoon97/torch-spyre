@@ -37,8 +37,8 @@ separate front-end, not on the compile path), no iteration-space heuristics, no
 | --- | --- | --- |
 | 2 pre-grad FX | `CustomPreGradPasses.__call__` | `node.meta` fields |
 | 2 post-grad FX | `CustomPostPasses.__call__` | `node.meta` fields |
-| 3 passes + 4 LoopLevelIR | `CustomPreSchedulingPasses.__call__` | `graph.operations[*]` origins/origin_node/traceback (value **and** `hasattr`), before & after the pass list |
-| 5 OpSpec | `SpyreKernel.create_op_spec` | input `ComputedBuffer.origins`; `OpSpec` declared fields |
+| 3 passes + 4 LoopLevelIR | `CustomPreSchedulingPasses.__call__` | `graph.operations[*]` origins/origin_node/traceback/get_stack_traces (value **and** `hasattr`), before & after the pass list |
+| 5 OpSpec | `SpyreKernel.create_op_spec` | input `ComputedBuffer.origins`; `OpSpec` declared fields + per-instance provenance-field population on the returned `OpSpec` |
 | 6 SuperDSC | `SuperDSCScheduling.define_kernel` + `async_compile.get_output_dir` | `kernel_name`, per-kernel origins, `get_kernel_metadata`, exact bundle dirs |
 
 Stage 6's JSON is then read by `superdsc.py` from the **exact** per-kernel
@@ -88,14 +88,18 @@ a given torch build is immediately visible rather than silently missing.
 - **Stage × Field matrix** — each column is measured **on the object that stage
   produces** (FX node → LoopLevelIR `ComputedBuffer` → the `OpSpec` dataclass →
   the emitted JSON). A leading **Layer** column groups fields by where they live:
-  `FX` (FX-node meta) or `IR` (`ComputedBuffer` attribute). *Inductor passes* is
-  the IR entering pre-scheduling; *LoopLevelIR* is the same IR after the passes
-  (which mutate it in place and insert `restickify` buffers, 5 → 7 ops), so an
-  in-pass drop — `origin_node` nulled on the matmuls — is visible (`✅` → `◐ 5/7`).
-  Symbols: `✅` present (all) · `◐ n/N` present on some · `❌` present-able here
-  but not carried (a genuine drop, or an empty slot like `traceback`) · `➖` not
-  applicable (not generated yet, or — for FX-meta downstream — carried only
-  indirectly via `origins`). The drop reads as the `✅`/`◐` → `❌` at `OpSpec`
+  `FX` (FX-node meta) or `IR` (`ComputedBuffer` attribute). The two IR columns
+  are the same LoopLevelIR: **LoopLevelIR (pre-pass)** entering the Spyre
+  pre-scheduling passes and **LoopLevelIR (post-pass)** after they mutate it in
+  place (e.g. inserting `restickify` buffers — which can change the op count and
+  null `origin_node` on synthesized buffers; issue #2574's "Inductor passes" →
+  "LoopLevelIR"). Every column tests **population**
+  (the field exists *and* is non-empty; `0` counts, `None`/`[]`/`{}`/`""` do
+  not). Symbols: `✅` present & non-empty on all · `◐ n/N` on some · `❌`
+  reachable here but measured empty/absent (a genuine drop **or** an op with no
+  source to carry, e.g. the unused `traceback` slot) · `➖` not applicable (no
+  such slot, or — for FX-meta downstream — carried only indirectly via
+  `origins`). The drop reads as the `✅`/`◐` → `❌` at `OpSpec`
   (the dataclass has no provenance field). The capture records `hasattr` per IR
   attribute, distinguishing an empty slot from a non-existent one.
 - **Per-stage detail** — observed field `type` per node/op, source lines, the

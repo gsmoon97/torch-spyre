@@ -35,15 +35,12 @@ import argparse
 import json
 import os
 import pathlib
-import sys
 
 # Force-disable Inductor caches before torch is imported anywhere downstream.
 os.environ.setdefault("TORCHINDUCTOR_FORCE_DISABLE_CACHES", "1")
 
 import torch
 import torch_spyre  # noqa: F401 — registers the Spyre backend
-
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from reference_mlp import SimpleMLP
 from pipeline import captures, superdsc, report

@@ -53,6 +53,12 @@ FX_META_FIELDS = [
 # Inductor IR / LoopLevelIR provenance attributes (on ComputedBuffer / loops).
 IR_ATTR_FIELDS = ["origins", "origin_node", "traceback"]
 
+# Provenance fields a future OpSpec could carry. Phase 1: none are populated
+# (the dataclass declares no provenance field); Phase 2 (#2575) adds
+# debug_handle. Captured per OpSpec instance so the OpSpec column can show
+# ◐ x/n once a field is declared but not populated on every op.
+OPSPEC_PROVENANCE_FIELDS = IR_ATTR_FIELDS + ["get_stack_traces", "debug_handle"]
+
 _MAX = 200  # repr truncation
 
 
@@ -60,7 +66,18 @@ def _safe(obj: Any) -> str:
     try:
         return str(obj)[:_MAX]
     except Exception as e:  # pragma: no cover - defensive
-        return f"<unreprable {type(obj).__name__}: {e}>"
+        return f"<unrepr-able {type(obj).__name__}: {e}>"
+
+
+def _is_populated(val: Any) -> bool:
+    """A provenance value counts as carried only if non-empty: ``0`` is
+    populated (a valid handle); ``None`` / empty collection / ``""`` are not.
+    This is the shared population rule used at every stage."""
+    if val is None:
+        return False
+    if isinstance(val, (list, tuple, set, dict, str)) and len(val) == 0:
+        return False
+    return True
 
 
 def _first_source_line(stack_trace: Any) -> str | None:
@@ -88,7 +105,11 @@ def _summarize_fx_meta(node: Any) -> dict:
             out[field] = None
             continue
         val = meta[field]
-        rec = {"type": type(val).__name__, "repr": _safe(val)}
+        rec = {
+            "type": type(val).__name__,
+            "repr": _safe(val),
+            "nonempty": _is_populated(val),
+        }
         if field == "stack_trace":
             rec["source_line"] = _first_source_line(val)
         out[field] = rec
@@ -119,9 +140,10 @@ def _summarize_ir_attrs(op: Any) -> dict:
     # Spyre/Inductor expose a derived stack-trace accessor on some IR nodes.
     if hasattr(op, "get_stack_traces"):
         try:
-            out["get_stack_traces"] = _safe(op.get_stack_traces())
+            st = op.get_stack_traces()
+            out["get_stack_traces"] = {"nonempty": bool(st), "repr": _safe(st)}
         except Exception as e:
-            out["get_stack_traces"] = f"<error: {e}>"
+            out["get_stack_traces"] = {"nonempty": False, "repr": f"<error: {e}>"}
     name = None
     for attr in ("get_operation_name", "get_name"):
         if hasattr(op, attr):
@@ -134,13 +156,23 @@ def _summarize_ir_attrs(op: Any) -> dict:
     # from its value. This distinguishes "the slot exists but is empty" (a real
     # absence / unused channel -> ✗) from "not an attribute of this object at
     # all" (not applicable -> ➖). getattr-with-default can't tell these apart.
-    attr_exists = {a: hasattr(op, a) for a in ("origins", "origin_node", "traceback")}
+    attr_exists = {
+        a: hasattr(op, a)
+        for a in ("origins", "origin_node", "traceback", "get_stack_traces")
+    }
+
     return {
         "name": name or _safe(op),
         "type": type(op).__name__,
         "fields": out,
         "attr_exists": attr_exists,
     }
+
+
+def _opspec_field_present(op_spec: Any, name: str) -> bool:
+    """Is provenance field ``name`` declared AND populated on this OpSpec
+    instance? (Existence + the shared non-empty rule.)"""
+    return hasattr(op_spec, name) and _is_populated(getattr(op_spec, name))
 
 
 def _graph_nodes(graph: Any):
@@ -192,8 +224,9 @@ def capture():
 
     # ---- Stage 2 pre-grad ------------------------------------------------
     def _pre_grad(original):
-        def wrapper(self, graph):
+        def wrapper(self, *args, **kwargs):
             try:
+                graph = args[0]
                 results["stage2_pre_grad"]["fired"] = True
                 results["stage2_pre_grad"]["nodes"] = [
                     _summarize_fx_meta(n)
@@ -202,14 +235,15 @@ def capture():
                 ]
             except Exception as e:
                 results["_hooks"]["stage2_pre_grad"] = f"error: {e}"
-            return original(self, graph)
+            return original(self, *args, **kwargs)
 
         return wrapper
 
     # ---- Stage 2 post-grad -----------------------------------------------
     def _post_grad(original):
-        def wrapper(self, graph):
+        def wrapper(self, *args, **kwargs):
             try:
+                graph = args[0]
                 results["stage2_post_grad"]["fired"] = True
                 results["stage2_post_grad"]["nodes"] = [
                     _summarize_fx_meta(n)
@@ -218,13 +252,14 @@ def capture():
                 ]
             except Exception as e:
                 results["_hooks"]["stage2_post_grad"] = f"error: {e}"
-            return original(self, graph)
+            return original(self, *args, **kwargs)
 
         return wrapper
 
     # ---- Stage 3 passes + Stage 4 LoopLevelIR ----------------------------
     def _pre_sched(original):
-        def wrapper(self, graph):
+        def wrapper(self, *args, **kwargs):
+            graph = args[0] if args else None
             try:
                 results["stage3_passes"]["fired"] = True
                 ops = list(getattr(graph, "operations", []) or [])
@@ -233,7 +268,7 @@ def capture():
                 ]
             except Exception as e:
                 results["_hooks"]["stage3_before"] = f"error: {e}"
-            ret = original(self, graph)
+            ret = original(self, *args, **kwargs)
             try:
                 ops = list(getattr(graph, "operations", []) or [])
                 after = [_summarize_ir_attrs(o) for o in ops]
@@ -249,24 +284,35 @@ def capture():
 
     # ---- Stage 5 OpSpec ---------------------------------------------------
     def _create_op_spec(original):
-        def wrapper(self, op, is_reduction, args, op_info):
+        def wrapper(self, *args, **kwargs):
+            op_spec = original(self, *args, **kwargs)
             try:
+                op, is_reduction, op_args, op_info = args[:4]
                 results["stage5_opspec"]["fired"] = True
                 ir_node = getattr(getattr(self, "current_node", None), "node", None)
                 rec = {"op": op, "is_reduction": is_reduction}
                 rec.update(_summarize_ir_attrs(ir_node) if ir_node is not None else {})
+                # Per-instance: is each provenance field populated ON the OpSpec
+                # object itself? Phase 1: all False (no such field). Phase 2+
+                # this lets the OpSpec column show ◐ x/n if a field is declared
+                # but not populated on every op (end-to-end guard, #2581).
+                rec["opspec_present"] = {
+                    name: _opspec_field_present(op_spec, name)
+                    for name in OPSPEC_PROVENANCE_FIELDS
+                }
                 results["stage5_opspec"]["ops"].append(rec)
             except Exception as e:
                 results["_hooks"]["stage5_opspec"] = f"error: {e}"
-            return original(self, op, is_reduction, args, op_info)
+            return op_spec
 
         return wrapper
 
     # ---- Stage 6 define_kernel -------------------------------------------
     def _define_kernel(original):
-        def wrapper(self, src_code, node_schedule, kernel):
-            kernel_name = original(self, src_code, node_schedule, kernel)
+        def wrapper(self, *args, **kwargs):
+            kernel_name = original(self, *args, **kwargs)
             try:
+                src_code, node_schedule, kernel = args[:3]
                 results["stage6_kernels"]["fired"] = True
                 node_origins = []
                 for sn in node_schedule:

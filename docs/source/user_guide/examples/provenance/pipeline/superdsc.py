@@ -31,23 +31,51 @@ import json
 import pathlib
 from typing import Any
 
-# Provenance field names (issue #2574) we scan the serialized JSON for.
+# Provenance field names we scan the serialized SDSC JSON for (issue #2574).
+# The first six are PyTorch's real FX node.meta / Inductor IR provenance keys;
+# "provenance" and "debug_handle" are forward-looking names for what Phase 2
+# (#2575) will thread through OpSpec/SDSC (debug_handle mirrors upstream's
+# _inductor_kernel_provenance_debug_handle).
 PROVENANCE_FIELD_NAMES = [
-    "stack_trace",
-    "original_aten",
-    "from_node",
-    "origins",
-    "origin_node",
-    "traceback",
-    "provenance",
-    "debug_handle",
-    "source",
+    "stack_trace",  # FX meta
+    "original_aten",  # FX meta
+    "from_node",  # IR attribute
+    "origins",  # IR attribute
+    "origin_node",  # IR attribute
+    "traceback",  # FX meta
+    "provenance",  # forward-looking
+    "debug_handle",  # forward-looking
 ]
 
 
-def _scan_json_for_provenance(text: str) -> dict[str, bool]:
-    low = text.lower()
-    return {name: (name.lower() in low) for name in PROVENANCE_FIELD_NAMES}
+def _is_populated(val: Any) -> bool:
+    """A provenance value counts as carried only if non-empty: ``0`` is
+    populated (a valid handle); ``None`` / empty collection / ``""`` are not.
+    Matches the population rule used at every other stage."""
+    if val is None:
+        return False
+    if isinstance(val, (list, tuple, set, dict, str)) and len(val) == 0:
+        return False
+    return True
+
+
+def _scan_json_for_provenance(obj: Any) -> dict[str, bool]:
+    # Population, not mere key presence: a key whose value is null/empty does
+    # NOT count (a serialized "debug_handle": null is not carried provenance).
+    found = {name: False for name in PROVENANCE_FIELD_NAMES}
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in found and _is_populated(v):
+                    found[k] = True
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(obj)
+    return found
 
 
 def read_bundle(kernel_name: str, output_dir: str) -> dict[str, Any]:
@@ -66,11 +94,11 @@ def read_bundle(kernel_name: str, output_dir: str) -> dict[str, Any]:
     for jf in sorted(d.glob("sdsc_*.json")):
         try:
             text = jf.read_text()
-            json.loads(text)  # validate
+            data = json.loads(text)  # validate
         except Exception as e:
             rec["sdsc_files"].append({"file": jf.name, "parse_error": str(e)})
             continue
-        hits = _scan_json_for_provenance(text)
+        hits = _scan_json_for_provenance(data)
         rec["sdsc_files"].append(
             {
                 "file": jf.name,
