@@ -210,6 +210,8 @@ class TestBuildDebugHandle:
             "/m.py:10:0",
             "/m.py:20:0",
         }
+        # Origins disagree -> both headline fields defer to fused_from (symmetric).
+        assert h.source is None  # distinct sources
         assert h.aten_op is None  # distinct atens
 
     def test_skips_torch_internal_frame(self):
