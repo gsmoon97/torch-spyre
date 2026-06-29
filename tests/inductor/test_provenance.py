@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from sympy import Integer, Symbol
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
 from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc, TensorArg
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
@@ -320,3 +321,22 @@ class TestSDSCSpecDebugHandle:
         )
         sdsc_spec, _ = parse_op_spec(_threadable_op_spec(debug_handle=h))
         assert sdsc_spec.debug_handle is h
+
+
+class TestGenerateSdscEmit:
+    def test_emits_debug_handle(self):
+        # Full OpSpec -> parse_op_spec -> SDSCSpec -> generate_sdsc -> JSON chain.
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        sdsc_spec, _ = parse_op_spec(_threadable_op_spec(debug_handle=h))
+        sdsc_json, *_ = generate_sdsc(0, sdsc_spec, [])
+        assert sdsc_json[f"0_{sdsc_spec.opfunc}"]["debug_handle_"] == h.to_dict()
+
+    def test_emits_null_when_absent(self):
+        sdsc_spec, _ = parse_op_spec(_threadable_op_spec())
+        sdsc_json, *_ = generate_sdsc(0, sdsc_spec, [])
+        assert sdsc_json[f"0_{sdsc_spec.opfunc}"]["debug_handle_"] is None
