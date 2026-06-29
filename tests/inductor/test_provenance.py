@@ -24,7 +24,7 @@ import pytest
 
 from types import SimpleNamespace
 
-from torch_spyre._inductor.op_spec import SourceLoc, DebugHandle
+from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
 
 
@@ -215,3 +215,29 @@ class TestBuildDebugHandle:
         )
         h = build_debug_handle(_buffer([n]))
         assert h.source.to_str() == "/home/u/model.py:42:0"
+
+
+class TestOpSpecDebugHandle:
+    def _make(self, **kw):
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={},
+            args=[],
+            op_info={},
+            **kw,
+        )
+
+    def test_defaults_to_none(self):
+        assert self._make().debug_handle is None
+
+    def test_accepts_debug_handle(self):
+        h = DebugHandle(
+            id=1,
+            source=SourceLoc("m.py", 1),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        spec = self._make(debug_handle=h)
+        assert spec.debug_handle is h
+        assert spec.debug_handle.aten_op == "aten.add.Tensor"
