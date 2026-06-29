@@ -157,6 +157,7 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    debug_handle: DebugHandle | None = None
 
 
 @dataclasses.dataclass

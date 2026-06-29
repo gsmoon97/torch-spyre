@@ -61,6 +61,7 @@ from .op_spec import (
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
 )
+from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -673,6 +674,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            debug_handle=build_debug_handle(ir_node),
         )
 
     def remove_kernel_local_buffers(self) -> None:
