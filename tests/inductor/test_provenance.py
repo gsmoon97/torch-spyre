@@ -22,8 +22,10 @@ import dataclasses
 
 import pytest
 
+from types import SimpleNamespace
+
 from torch_spyre._inductor.op_spec import SourceLoc, DebugHandle
-from torch_spyre._inductor.provenance import _stable_id
+from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
 
 
 class TestSourceLoc:
@@ -135,3 +137,81 @@ class TestDebugHandle:
         assert d["ir_chain"] == ["mm_default_1", "op0"]
         assert d["fused_from"][0]["aten_op"] == "aten.permute.default"
         assert d["fusion_context"] is None
+
+
+def _node(name, file=None, line=None, aten=None):
+    """Fake FX node: .name + .meta with stack_trace/original_aten."""
+    trace = None
+    if file is not None:
+        trace = f'  File "{file}", line {line}, in forward\n    x = f(x)\n'
+    return SimpleNamespace(
+        name=name, meta={"stack_trace": trace, "original_aten": aten}
+    )
+
+
+def _buffer(origins, origin_node=None, name="op0"):
+    """Fake ComputedBuffer: .origins, optional .origin_node, .get_name().
+
+    The real ``origins`` is a set of (hashable) fx.Node; our fake nodes are
+    ``SimpleNamespace`` (unhashable — it defines ``__eq__``), so we hold them as
+    a tuple. ``build_debug_handle`` only iterates/sorts ``origins``, never relies
+    on set semantics, so this is faithful for the logic under test.
+    """
+    return SimpleNamespace(
+        origins=tuple(origins), origin_node=origin_node, get_name=lambda: name
+    )
+
+
+class TestBuildDebugHandle:
+    def test_empty_origins_returns_none(self):
+        assert build_debug_handle(_buffer([])) is None
+
+    def test_single_op_with_origin_node(self):
+        # Inductor's clean 1:1 case (e.g. pointwise relu): use origin_node.
+        relu = _node("relu", "/home/u/model.py", 42, "aten.relu.default")
+        h = build_debug_handle(_buffer([relu], origin_node=relu, name="op2"))
+        assert h.source.to_str() == "/home/u/model.py:42:0"
+        assert h.aten_op == "aten.relu.default"
+        assert h.fused_from == ()  # single origin -> no fusion set
+
+    def test_origin_node_set_without_trace_borrows_source(self):
+        # origin_node present but trace-less: aten from it, source from a sibling.
+        mm = _node("mm_default_1", aten="aten.mm.default")  # no stack_trace
+        permute = _node("permute", "/home/u/model.py", 117, "aten.permute.default")
+        h = build_debug_handle(_buffer([mm, permute], origin_node=mm, name="op0"))
+        assert h.aten_op == "aten.mm.default"  # from origin_node
+        assert h.source.to_str() == "/home/u/model.py:117:0"  # borrowed
+        assert "mm_default_1" in h.ir_chain and "op0" in h.ir_chain
+
+    def test_fused_view_no_origin_node_is_ambiguous(self):
+        # Realistic fused matmul: Inductor leaves origin_node None (a view fused
+        # in). No single primary -> headline aten_op is None; fused_from is truth.
+        mm = _node("mm_default_1", aten="aten.mm.default")  # no stack_trace
+        permute = _node("permute", "/home/u/model.py", 117, "aten.permute.default")
+        h = build_debug_handle(_buffer([mm, permute], name="op0"))  # origin_node=None
+        assert h.source.to_str() == "/home/u/model.py:117:0"  # borrowed headline
+        assert h.aten_op is None  # two distinct atens -> do not guess
+        assert {c.aten_op for c in h.fused_from} == {
+            "aten.mm.default",
+            "aten.permute.default",
+        }
+
+    def test_fused_from_lists_all_origins(self):
+        add = _node("add", "/m.py", 10, "aten.add.Tensor")
+        relu = _node("relu", "/m.py", 20, "aten.relu.default")
+        h = build_debug_handle(_buffer([add, relu], name="op1"))
+        assert len(h.fused_from) == 2
+        assert {c.source.to_str() for c in h.fused_from} == {
+            "/m.py:10:0",
+            "/m.py:20:0",
+        }
+        assert h.aten_op is None  # distinct atens
+
+    def test_skips_torch_internal_frame(self):
+        n = _node("x", aten="aten.linear.default")
+        n.meta["stack_trace"] = (
+            '  File "/usr/lib/torch/_ops.py", line 5, in f\n'
+            '  File "/home/u/model.py", line 42, in forward\n'
+        )
+        h = build_debug_handle(_buffer([n]))
+        assert h.source.to_str() == "/home/u/model.py:42:0"
