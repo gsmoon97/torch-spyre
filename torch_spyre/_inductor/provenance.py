@@ -71,9 +71,16 @@ def _aten_from_node(node: Any) -> str | None:
     return str(op) if op is not None else None
 
 
-def _first_source(per_node: list) -> SourceLoc | None:
-    """Headline source: borrow from the first origin (stable order) that has one."""
-    return next((s for (_, s, _) in per_node if s is not None), None)
+def _headline_source(per_node: list) -> SourceLoc | None:
+    """The single distinct source if the origins agree on one, else None.
+
+    Symmetric with the ``aten_op`` rule in ``build_debug_handle``: we never
+    present an arbitrary line as *the* source of an op fused across multiple
+    distinct source locations. When the origins disagree, the headline is None
+    and the full set lives in ``fused_from`` (consumers pick a representative).
+    """
+    distinct = {s.to_str(): s for (_, s, _) in per_node if s is not None}
+    return next(iter(distinct.values())) if len(distinct) == 1 else None
 
 
 def build_debug_handle(buffer: Any) -> DebugHandle | None:
@@ -95,14 +102,16 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
     origin_node = getattr(buffer, "origin_node", None)
 
     if origin_node is not None:
-        # Inductor's authoritative 1:1 op: take its aten/source directly,
-        # borrowing source from a sibling only if it has none.
+        # Inductor's authoritative 1:1 op: take its aten/source directly. If it
+        # has no stack_trace, fall back only to a single agreed sibling source.
         aten_op = _aten_from_node(origin_node)
-        source = _source_from_node(origin_node) or _first_source(per_node)
+        source = _source_from_node(origin_node) or _headline_source(per_node)
     else:
-        # Fused/view: headline source borrowed from a sibling; aten_op only if
-        # the origins carry a single distinct aten, else None (do not guess).
-        source = _first_source(per_node)
+        # Fused/view: headline source and aten_op are set only when the origins
+        # agree on a single distinct value; otherwise None (do not guess) — the
+        # full per-origin set is preserved in fused_from. Source and aten are
+        # handled symmetrically.
+        source = _headline_source(per_node)
         atens = {a for (_, _, a) in per_node if a is not None}
         aten_op = next(iter(atens)) if len(atens) == 1 else None
 
