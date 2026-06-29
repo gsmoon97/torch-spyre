@@ -24,7 +24,11 @@ import pytest
 
 from types import SimpleNamespace
 
-from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc
+from sympy import Integer, Symbol
+
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
+from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc, TensorArg
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
 
 
@@ -241,3 +245,78 @@ class TestOpSpecDebugHandle:
         spec = self._make(debug_handle=h)
         assert spec.debug_handle is h
         assert spec.debug_handle.aten_op == "aten.add.Tensor"
+
+
+def _threadable_op_spec(debug_handle=None):
+    """Minimal OpSpec that parse_op_spec can process (mirrors test_coarse_tiling)."""
+    c0 = Symbol("c0")
+    fp16 = DataFormats.SEN169_FP16
+    tin = TensorArg(
+        is_input=True,
+        arg_index=0,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x1000},
+    )
+    tout = TensorArg(
+        is_input=False,
+        arg_index=1,
+        device_dtype=fp16,
+        device_size=[2, 64],
+        device_coordinates=[Integer(0), c0],
+        allocation={"hbm": 0x2000},
+    )
+    return OpSpec(
+        op="add",
+        is_reduction=False,
+        iteration_space={c0: (Integer(128), 1)},
+        args=[tin, tout],
+        op_info={},
+        tiled_symbols=[c0],
+        debug_handle=debug_handle,
+    )
+
+
+class TestSDSCSpecDebugHandle:
+    def _make(self, **kw):
+        return SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=DataFormats.SEN169_FP16,
+            num_inputs=1,
+            iteration_space={},
+            num_cores=1,
+            work_slices={},
+            core_id_to_work_slice={},
+            padding={},
+            layouts={},
+            args=[],
+            constants={},
+            coordinate_masking={},
+            **kw,
+        )
+
+    def test_defaults_to_none(self):
+        assert self._make().debug_handle is None
+
+    def test_accepts_debug_handle(self):
+        h = DebugHandle(
+            id=1,
+            source=SourceLoc("m.py", 1),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        assert self._make(debug_handle=h).debug_handle is h
+
+    def test_parse_op_spec_threads_handle(self):
+        # parse_op_spec builds the SDSCSpec from an OpSpec; the handle must
+        # survive that translation (the OpSpec -> SDSCSpec threading).
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        sdsc_spec, _ = parse_op_spec(_threadable_op_spec(debug_handle=h))
+        assert sdsc_spec.debug_handle is h
