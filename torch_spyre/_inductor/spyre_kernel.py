@@ -983,6 +983,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
+                if op_spec.debug_handle is not None:
+                    # Source-to-kernel provenance must survive the OpSpec ->
+                    # generated-source -> exec round-trip. DebugHandle/SourceLoc
+                    # are frozen dataclasses, so repr() is eval-able; the
+                    # generated wrapper header imports both names.
+                    buf.writeline(f"debug_handle={op_spec.debug_handle!r},")
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in op_spec.args:
