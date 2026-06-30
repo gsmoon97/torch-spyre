@@ -24,13 +24,16 @@ import pytest
 
 from types import SimpleNamespace
 
-from sympy import Integer, Symbol
+from sympy import Integer, Symbol, sympify
+
+from torch._inductor.utils import IndentedBuffer
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
 from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc, TensorArg
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
+from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 
 
 class TestSourceLoc:
@@ -342,3 +345,87 @@ class TestGenerateSdscEmit:
         sdsc_spec, _ = parse_op_spec(_threadable_op_spec())
         sdsc_json, *_ = generate_sdsc(0, sdsc_spec, [])
         assert sdsc_json[f"0_{sdsc_spec.opfunc}"]["debug_handle_"] is None
+
+
+class TestCodegenRoundTrip:
+    """The OpSpec source-codegen -> exec seam.
+
+    torch-spyre serializes each OpSpec to Python source (``_codegen_op_spec_list``)
+    then writes and re-execs it to drive SDSC generation. Every other test in
+    this file feeds a hand-built ``OpSpec`` straight into ``parse_op_spec`` /
+    ``generate_sdsc``, so none cross this seam -- which is exactly where
+    ``debug_handle`` was dropped: populated on the in-process ``OpSpec`` but
+    ``None`` after the round-trip (and therefore ``null`` in every emitted
+    ``sdsc_*.json``). These tests guard the seam.
+    """
+
+    # Mirrors the names the generated kernel module imports (wrapper.py
+    # ``write_header``): the reconstructed ``OpSpec`` source references them.
+    _EVAL_NS = {
+        "OpSpec": OpSpec,
+        "TensorArg": TensorArg,
+        "DebugHandle": DebugHandle,
+        "SourceLoc": SourceLoc,
+        "DataFormats": DataFormats,
+        "sympify": sympify,
+    }
+
+    def _roundtrip(self, op_spec):
+        """Serialize one OpSpec to source and eval it back (the real path)."""
+
+        def sympy_str(x):
+            return "sympify('" + str(x) + "')"
+
+        buf = IndentedBuffer()
+        buf.writeline("[")
+        with buf.indent():
+            _codegen_op_spec_list([op_spec], buf, sympy_str)
+        buf.writeline("]")
+        return eval(buf.getvalue(), dict(self._EVAL_NS))[0]  # noqa: S307
+
+    def test_debug_handle_survives_codegen_roundtrip(self):
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        result = self._roundtrip(_threadable_op_spec(debug_handle=h))
+        assert result.debug_handle == h
+
+    def test_fused_handle_with_children_survives_roundtrip(self):
+        # The n->1 fusion case: nested fused_from must survive too.
+        child = DebugHandle(
+            id=1,
+            source=SourceLoc("m.py", 5),
+            aten_op="aten.permute.default",
+            ir_chain=("permute",),
+        )
+        h = DebugHandle(
+            id=2,
+            source=None,
+            aten_op=None,
+            ir_chain=("mm_default_1", "op0"),
+            fused_from=(child,),
+        )
+        result = self._roundtrip(_threadable_op_spec(debug_handle=h))
+        assert result.debug_handle == h
+        assert result.debug_handle.fused_from[0].aten_op == "aten.permute.default"
+
+    def test_absent_handle_roundtrips_as_none(self):
+        result = self._roundtrip(_threadable_op_spec())
+        assert result.debug_handle is None
+
+    def test_handle_reaches_sdsc_json_after_roundtrip(self):
+        # End-to-end reproduction of the audit finding: the handle must survive
+        # codegen->exec AND serialize into the SDSC JSON (was null before fix).
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+        )
+        rt = self._roundtrip(_threadable_op_spec(debug_handle=h))
+        sdsc_spec, _ = parse_op_spec(rt)
+        sdsc_json, *_ = generate_sdsc(0, sdsc_spec, [])
+        assert sdsc_json[f"0_{sdsc_spec.opfunc}"]["debug_handle_"] == h.to_dict()
