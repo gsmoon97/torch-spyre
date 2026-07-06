@@ -16,8 +16,8 @@
 
 The provenance *types* (``SourceLoc``, ``DebugHandle``) live in ``op_spec.py``
 alongside the other IR-op schema dataclasses. This module holds the *logic* that
-builds them from Inductor IR: stable-id hashing here, and ``build_debug_handle``
-(reading ``ComputedBuffer.origins``) in a later task.
+builds them from Inductor IR: stable-id hashing and ``build_debug_handle``, which
+reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def _stable_id(
     aten_op: str | None,
     ir_chain: tuple[str, ...],
 ) -> int:
-    """Deterministic content hash. Reproducible across processes (unlike hash())."""
+    """Deterministic content hash. Reproducible across processes."""
     canonical = "|".join(
         [
             source.to_str() if source is not None else "",
@@ -47,7 +47,14 @@ def _stable_id(
         ]
     )
     digest = hashlib.sha256(canonical.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") >> 1  # 63-bit non-negative int
+    # Top 8 bytes = 64 bits; ``>> 1`` drops the sign bit so the id is a
+    # non-negative value that always fits a *signed* 64-bit integer, the common
+    # interchange width (JSON int64, MLIR ``i64``, protobuf ``int64``). A full
+    # 64-bit value could be read as negative in those consumers.
+    # Caveat: 63 bits exceeds JS ``Number.MAX_SAFE_INTEGER`` (2**53 - 1), so a
+    # JavaScript consumer (e.g. the Phase-4a HTML/JS viewer) should read the id
+    # as a string, not a number, to avoid float64 precision loss.
+    return int.from_bytes(digest[:8], "big") >> 1
 
 
 def _source_from_node(node: Any) -> SourceLoc | None:
@@ -59,6 +66,9 @@ def _source_from_node(node: Any) -> SourceLoc | None:
     matches = _FRAME_RE.findall(trace)
     if not matches:
         return None
+    # Prefer the innermost non-torch frame: the model source line closest to the
+    # op call (frames run outermost -> innermost, so [-1] is closest). Fall back to
+    # the innermost frame overall when every frame is torch-internal.
     user = [(f, ln) for (f, ln) in matches if "/torch/" not in f]
     file, line = (user or matches)[-1]
     return SourceLoc(file=file, start_line=int(line))
@@ -71,7 +81,9 @@ def _aten_from_node(node: Any) -> str | None:
     return str(op) if op is not None else None
 
 
-def _headline_source(per_node: list) -> SourceLoc | None:
+def _headline_source(
+    per_node: list[tuple[str, SourceLoc | None, str | None]],
+) -> SourceLoc | None:
     """The single distinct source if the origins agree on one, else None.
 
     Symmetric with the ``aten_op`` rule in ``build_debug_handle``: we never
@@ -89,12 +101,25 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
     ``origins`` (the set) is authoritative. ``origin_node`` is used only when
     Inductor set it (the clean 1:1 non-view case); for fused/view ops it is None
     and we do not invent a primary — the full set lives in ``fused_from``.
+
+    This function only *iterates and sorts* ``origins``; it never relies on set
+    identity or insertion order. The caller may pass any iterable (``OrderedSet``,
+    plain ``set``, or the fake tuple used in tests).
     """
     origins = getattr(buffer, "origins", None) or set()
     if not origins:
         return None
-    # Stable iteration order; NOT a semantic primary pick (full truth in fused_from).
-    nodes = sorted(origins, key=lambda n: getattr(n, "name", ""))
+    # Sort by (name, aten_op) for a fully deterministic ir_chain and _stable_id.
+    # FX guarantees node names are unique within a graph (_Namespace deduplicates
+    # with _N suffixes), so duplicate primary keys cannot arise in practice;
+    # the secondary key is a defensive tie-breaker for any future synthetic nodes.
+    nodes = sorted(
+        origins,
+        key=lambda n: (
+            getattr(n, "name", ""),
+            str((getattr(n, "meta", None) or {}).get("original_aten", "")),
+        ),
+    )
     per_node = [
         (getattr(n, "name", ""), _source_from_node(n), _aten_from_node(n))
         for n in nodes

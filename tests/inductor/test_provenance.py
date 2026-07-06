@@ -226,6 +226,19 @@ class TestBuildDebugHandle:
         h = build_debug_handle(_buffer([n]))
         assert h.source.to_str() == "/home/u/model.py:42:0"
 
+    def test_sort_is_deterministic_with_same_name(self):
+        # Defensive: two synthetic nodes with the same .name (impossible in a real
+        # FX graph — _Namespace guarantees uniqueness — but the secondary sort key
+        # on aten_op ensures the ir_chain and _stable_id are deterministic even if
+        # a future synthetic node bypasses the namespace deduplication.
+        n_add = _node("synthetic", aten="aten.add.Tensor")
+        n_mul = _node("synthetic", aten="aten.mul.Tensor")
+        # Regardless of input order, ir_chain must be the same.
+        h1 = build_debug_handle(_buffer([n_add, n_mul], name="op0"))
+        h2 = build_debug_handle(_buffer([n_mul, n_add], name="op0"))
+        assert h1.ir_chain == h2.ir_chain
+        assert h1.id == h2.id
+
 
 class TestOpSpecDebugHandle:
     def _make(self, **kw):
