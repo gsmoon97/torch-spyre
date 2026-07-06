@@ -292,7 +292,7 @@ def _threadable_op_spec(debug_handle=None):
         iteration_space={c0: (Integer(128), 1)},
         args=[tin, tout],
         op_info={},
-        tiled_symbols=[c0],
+        tiled_symbols=[[c0]],
         debug_handle=debug_handle,
     )
 
