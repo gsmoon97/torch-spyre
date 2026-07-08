@@ -20,10 +20,10 @@ Every measurement reads the *actual* compilation object (no torch.export, no
 heuristics). Each stage is observed by class-level monkey-patches installed for
 the duration of one ``torch.compile``:
 
-    Stage 2 pre-grad FX   CustomPreGradPasses.__call__(graph)        [passes.py]
-    Stage 2 post-grad FX  CustomPostPasses.__call__(graph)          [passes.py]
-    Stage 3 Inductor pass CustomPreSchedulingPasses.__call__(graph) [passes.py]
-    Stage 4 LoopLevelIR     (read graph.operations after stage-3 passes)
+    Stage 2 FX Graph (pre-grad)   CustomPreGradPasses.__call__(graph)        [passes.py]
+    Stage 2 FX Graph (post-grad)  CustomPostPasses.__call__(graph)          [passes.py]
+    Stage 3 LoopLevelIR (pre-pass)  CustomPreSchedulingPasses.__call__(graph) [passes.py]
+    Stage 4 LoopLevelIR (post-pass) (read graph.operations after the passes)
     Stage 5 OpSpec        SpyreKernel.create_op_spec                [spyre_kernel.py]
     Stage 6 SuperDSC      SuperDSCScheduling.define_kernel +        [scheduler.py]
                           async_compile.get_output_dir (exact dirs) [async_compile.py]
@@ -41,23 +41,11 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-# FX node.meta provenance fields (issue #2574).
-FX_META_FIELDS = [
-    "stack_trace",
-    "nn_module_stack",
-    "source_fn_stack",
-    "original_aten",
-    "from_node",
-]
-
-# Inductor IR / LoopLevelIR provenance attributes (on ComputedBuffer / loops).
-IR_ATTR_FIELDS = ["origins", "origin_node", "traceback"]
-
-# Provenance fields a future OpSpec could carry. Phase 1: none are populated
-# (the dataclass declares no provenance field); Phase 2 (#2575) adds
-# debug_handle. Captured per OpSpec instance so the OpSpec column can show
-# ◐ x/n once a field is declared but not populated on every op.
-OPSPEC_PROVENANCE_FIELDS = IR_ATTR_FIELDS + ["get_stack_traces", "debug_handle"]
+# Field names come from the single source of truth in fields.py so the capture
+# and report layers can never drift. FX_META_FIELDS is the same list the report
+# calls FX_FIELDS.
+from .fields import FX_FIELDS as FX_META_FIELDS
+from .fields import OPSPEC_PROVENANCE_FIELDS
 
 _MAX = 200  # repr truncation
 
@@ -118,6 +106,13 @@ def _summarize_fx_meta(node: Any) -> dict:
         "op": getattr(node, "op", None),
         "target": _safe(getattr(node, "target", "")),
         "all_meta_keys": sorted(meta.keys()),
+        # Data-flow predecessors (fx.Node.all_input_nodes). Used by the report's
+        # lineage tree to trace a source-less node back to the nearest ancestor
+        # that carries a source line (e.g. an addmm bias-add -> its matmul ->
+        # the weight permute that kept the stack_trace).
+        "input_nodes": [
+            _node_name(n) for n in (getattr(node, "all_input_nodes", None) or [])
+        ],
         "fields": out,
     }
 
@@ -155,17 +150,26 @@ def _summarize_ir_attrs(op: Any) -> dict:
     # Record whether each provenance attribute *exists* on the object, separate
     # from its value. This distinguishes "the slot exists but is empty" (a real
     # absence / unused channel -> ✗) from "not an attribute of this object at
-    # all" (not applicable -> ➖). getattr-with-default can't tell these apart.
+    # all" (not applicable). getattr-with-default can't tell these apart.
     attr_exists = {
         a: hasattr(op, a)
         for a in ("origins", "origin_node", "traceback", "get_stack_traces")
     }
+    # Full public instance-attribute inventory, so the report's per-stage
+    # "dynamic list" surfaces any provenance attribute we don't yet track in a
+    # column (mirrors OpSpec's declared-fields list). Best-effort: some IR
+    # objects use __slots__ and have no __dict__.
+    try:
+        all_attrs = sorted(k for k in vars(op) if not k.startswith("_"))
+    except TypeError:
+        all_attrs = []
 
     return {
         "name": name or _safe(op),
         "type": type(op).__name__,
         "fields": out,
         "attr_exists": attr_exists,
+        "all_attrs": all_attrs,
     }
 
 
@@ -173,6 +177,48 @@ def _opspec_field_present(op_spec: Any, name: str) -> bool:
     """Is provenance field ``name`` declared AND populated on this OpSpec
     instance? (Existence + the shared non-empty rule.)"""
     return hasattr(op_spec, name) and _is_populated(getattr(op_spec, name))
+
+
+def _source_loc_str(src: Any) -> str | None:
+    """Render a structured ``SourceLoc`` dict as ``basename:line`` for display.
+
+    Returns None when there is no resolvable source (``source`` is null, or the
+    handle points only at an ATen op). Handles an optional ``end_line`` so a
+    future multi-line range renders as ``basename:line-endline`` without a code
+    change here.
+    """
+    if not isinstance(src, dict):
+        return None
+    file = src.get("file")
+    start = src.get("start_line")
+    if not file or start is None:
+        return None
+    base = str(file).rsplit("/", 1)[-1]
+    end = src.get("end_line")
+    return f"{base}:{start}-{end}" if end and end != start else f"{base}:{start}"
+
+
+def _summarize_debug_handle(dh: Any) -> dict | None:
+    """Summarize an ``OpSpec.debug_handle`` (a ``DebugHandle``) for the dump.
+
+    Phase 2a (#2575) added ``debug_handle`` as the OpSpec provenance carrier.
+    We store the handle's full ``to_dict()`` verbatim (so fields the later
+    phases populate -- ``fused_from`` under fusion, ``fusion_context`` from the
+    Phase-2b pass observer #2576 -- surface in the dump without changing this
+    capture) and add a derived ``source_line`` for the report. Returns None when
+    the OpSpec carries no handle. Read-only: no compiler behavior changes.
+    """
+    if dh is None:
+        return None
+    try:
+        d = dh.to_dict() if hasattr(dh, "to_dict") else dh
+    except Exception as e:  # pragma: no cover - defensive
+        return {"error": f"to_dict failed: {e}", "repr": _safe(dh)}
+    if not isinstance(d, dict):
+        return {"repr": _safe(dh)}
+    rec = dict(d)  # full DebugHandle schema, verbatim
+    rec["source_line"] = _source_loc_str(d.get("source"))
+    return rec
 
 
 def _graph_nodes(graph: Any):
@@ -186,14 +232,14 @@ def capture():
     """Install all stage hooks for the duration of the with-block.
 
     Yields a results dict, fully populated once the block exits. Top-level keys:
-    stage2_pre_grad, stage2_post_grad, stage3_passes, stage4_looplevel,
+    stage2_pre_grad, stage2_post_grad, stage3_looplevel_prepass, stage4_looplevel_postpass,
     stage5_opspec, stage6_kernels, plus "_hooks" (fired/error per hook).
     """
     results: dict[str, Any] = {
         "stage2_pre_grad": {"fired": False, "nodes": []},
         "stage2_post_grad": {"fired": False, "nodes": []},
-        "stage3_passes": {"fired": False, "before": [], "after": []},
-        "stage4_looplevel": {"fired": False, "operations": []},
+        "stage3_looplevel_prepass": {"fired": False, "operations": []},
+        "stage4_looplevel_postpass": {"fired": False, "operations": []},
         "stage5_opspec": {"fired": False, "ops": [], "opspec_fields": None},
         "stage6_kernels": {"fired": False, "kernels": [], "output_dirs": {}},
         "_hooks": {},
@@ -256,28 +302,30 @@ def capture():
 
         return wrapper
 
-    # ---- Stage 3 passes + Stage 4 LoopLevelIR ----------------------------
+    # ---- Stage 3 LoopLevelIR (pre-pass) + Stage 4 LoopLevelIR (post-pass) --
+    # One hook on the pre-scheduling passes captures both snapshots: the IR
+    # entering the passes is Stage 3 (pre-pass), the IR leaving them is Stage 4
+    # (post-pass). Each stage records a single `operations` list (symmetric).
     def _pre_sched(original):
         def wrapper(self, *args, **kwargs):
             graph = args[0] if args else None
             try:
-                results["stage3_passes"]["fired"] = True
+                results["stage3_looplevel_prepass"]["fired"] = True
                 ops = list(getattr(graph, "operations", []) or [])
-                results["stage3_passes"]["before"] = [
+                results["stage3_looplevel_prepass"]["operations"] = [
                     _summarize_ir_attrs(o) for o in ops
                 ]
             except Exception as e:
-                results["_hooks"]["stage3_before"] = f"error: {e}"
+                results["_hooks"]["stage3_looplevel_prepass"] = f"error: {e}"
             ret = original(self, *args, **kwargs)
             try:
                 ops = list(getattr(graph, "operations", []) or [])
-                after = [_summarize_ir_attrs(o) for o in ops]
-                results["stage3_passes"]["after"] = after
-                # Stage 4 LoopLevelIR == operations state after pre-scheduling.
-                results["stage4_looplevel"]["fired"] = True
-                results["stage4_looplevel"]["operations"] = after
+                results["stage4_looplevel_postpass"]["fired"] = True
+                results["stage4_looplevel_postpass"]["operations"] = [
+                    _summarize_ir_attrs(o) for o in ops
+                ]
             except Exception as e:
-                results["_hooks"]["stage3_after"] = f"error: {e}"
+                results["_hooks"]["stage4_looplevel_postpass"] = f"error: {e}"
             return ret
 
         return wrapper
@@ -300,6 +348,12 @@ def capture():
                     name: _opspec_field_present(op_spec, name)
                     for name in OPSPEC_PROVENANCE_FIELDS
                 }
+                # Phase 2a: also capture the handle's value (not just presence)
+                # so the report can show OpSpec -> source line directly at the
+                # boundary that historically dropped provenance.
+                rec["debug_handle"] = _summarize_debug_handle(
+                    getattr(op_spec, "debug_handle", None)
+                )
                 results["stage5_opspec"]["ops"].append(rec)
             except Exception as e:
                 results["_hooks"]["stage5_opspec"] = f"error: {e}"
@@ -362,7 +416,12 @@ def capture():
     hook_specs = [
         (_passes, "CustomPreGradPasses.__call__", _pre_grad, "stage2_pre_grad"),
         (_passes, "CustomPostPasses.__call__", _post_grad, "stage2_post_grad"),
-        (_passes, "CustomPreSchedulingPasses.__call__", _pre_sched, "stage3_passes"),
+        (
+            _passes,
+            "CustomPreSchedulingPasses.__call__",
+            _pre_sched,
+            "stage3_looplevel_prepass",
+        ),
         (_sk, "SpyreKernel.create_op_spec", _create_op_spec, "stage5_opspec"),
         (
             _sched,
