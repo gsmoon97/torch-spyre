@@ -73,6 +73,12 @@ class DebugHandle:
 
     Nestable to map onto MLIR locations: ``NameLoc(aten_op) -> SourceLoc``,
     ``fused_from -> FusedLoc``, ``ir_chain -> CallSiteLoc`` lineage.
+
+    A ``None`` ``source`` or ``aten_op`` is a *normal, expected* value, not a
+    missing-data error: when an op fuses origins from several distinct source
+    lines there is no single honest headline, so both are set to ``None`` and the
+    full set is preserved in ``fused_from``. Consumers should fall back to
+    ``fused_from`` rather than treating a null headline as an error.
     """
 
     id: int
@@ -84,7 +90,11 @@ class DebugHandle:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "id": self.id,
+            # id is serialized as a string: a 63-bit value exceeds JS
+            # Number.MAX_SAFE_INTEGER (2**53-1), and JSON.parse would round it to
+            # float64 before a consumer could act. The dataclass field stays int
+            # for the MLIR/protobuf mapping (a separate serializer).
+            "id": str(self.id),
             "source": self.source.to_dict() if self.source is not None else None,
             "aten_op": self.aten_op,
             "ir_chain": list(self.ir_chain),

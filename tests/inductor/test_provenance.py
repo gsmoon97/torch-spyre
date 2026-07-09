@@ -146,6 +146,24 @@ class TestDebugHandle:
         assert d["fused_from"][0]["aten_op"] == "aten.permute.default"
         assert d["fusion_context"] is None
 
+    def test_to_dict_serializes_id_as_string_for_js_safety(self):
+        # A 63-bit id exceeds JS Number.MAX_SAFE_INTEGER (2**53-1); a JSON number
+        # would be rounded to float64 at JSON.parse. to_dict emits it as a string
+        # (nested fused_from too). The dataclass field stays int for MLIR/protobuf.
+        big = (1 << 62) + 1  # > MAX_SAFE_INTEGER
+        child = DebugHandle(id=big + 1, source=None, aten_op="a", ir_chain=("n",))
+        h = DebugHandle(
+            id=big,
+            source=SourceLoc("m.py", 5),
+            aten_op="aten.mm.default",
+            ir_chain=("mm_default_1", "op0"),
+            fused_from=(child,),
+        )
+        d = h.to_dict()
+        assert d["id"] == str(big) and isinstance(d["id"], str)
+        assert d["fused_from"][0]["id"] == str(big + 1)
+        assert isinstance(h.id, int)  # field unchanged for MLIR/protobuf mapping
+
 
 def _node(name, file=None, line=None, aten=None):
     """Fake FX node: .name + .meta with stack_trace/original_aten."""

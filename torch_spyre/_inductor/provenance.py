@@ -38,7 +38,14 @@ def _stable_id(
     aten_op: str | None,
     ir_chain: tuple[str, ...],
 ) -> int:
-    """Deterministic content hash. Reproducible across processes."""
+    """Deterministic content hash of an op's provenance.
+
+    Stability contract: reproducible for the same op within a compile and across
+    recompiles on the same toolchain, but NOT across torch/scheduler versions
+    (``ir_chain`` includes scheduling-assigned buffer names). It is a within-compile
+    linking key, not a cross-run fingerprint; cross-version consumers should key on
+    ``source`` + ``aten_op`` instead.
+    """
     canonical = "|".join(
         [
             source.to_str() if source is not None else "",
@@ -51,9 +58,9 @@ def _stable_id(
     # non-negative value that always fits a *signed* 64-bit integer, the common
     # interchange width (JSON int64, MLIR ``i64``, protobuf ``int64``). A full
     # 64-bit value could be read as negative in those consumers.
-    # Caveat: 63 bits exceeds JS ``Number.MAX_SAFE_INTEGER`` (2**53 - 1), so a
-    # JavaScript consumer (e.g. the Phase-4a HTML/JS viewer) should read the id
-    # as a string, not a number, to avoid float64 precision loss.
+    # Caveat: 63 bits exceeds JS ``Number.MAX_SAFE_INTEGER`` (2**53 - 1), so
+    # ``DebugHandle.to_dict`` serializes the id as a string on the JSON path
+    # (a JSON number would be rounded to float64 at ``JSON.parse`` time).
     return int.from_bytes(digest[:8], "big") >> 1
 
 
@@ -96,7 +103,11 @@ def _headline_source(
 
 
 def build_debug_handle(buffer: Any) -> DebugHandle | None:
-    """Build a DebugHandle from a ComputedBuffer's origins. Best-effort, never raises.
+    """Build a DebugHandle from a ComputedBuffer's origins. Best-effort.
+
+    Returns None when no handle can be derived. Provenance is debug-only, so the
+    compile-path caller (``create_op_spec``) also wraps this in try/except — a
+    failure here never breaks a build.
 
     ``origins`` (the set) is authoritative. ``origin_node`` is used only when
     Inductor set it (the clean 1:1 non-view case); for fused/view ops it is None

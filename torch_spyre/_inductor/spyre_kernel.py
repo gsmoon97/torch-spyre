@@ -672,6 +672,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             if bounds is not None:
                 symbolic_dim_bounds[str(size_expr)] = bounds
 
+        # Provenance is a debug-only feature: a failure building the handle must
+        # never break a compile. build_debug_handle is best-effort, but guard the
+        # call site too so an unexpected node shape can't fail create_op_spec.
+        try:
+            debug_handle = build_debug_handle(ir_node)
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            logger.warning(
+                "debug_handle construction failed for op %s; continuing without "
+                "provenance",
+                op,
+                exc_info=True,
+            )
+            debug_handle = None
+
         return OpSpec(
             op,
             is_reduction,
@@ -680,7 +694,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
-            debug_handle=build_debug_handle(ir_node),
+            debug_handle=debug_handle,
         )
 
     def remove_kernel_local_buffers(self) -> None:
