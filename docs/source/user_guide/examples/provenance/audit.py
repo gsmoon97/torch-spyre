@@ -15,10 +15,9 @@
 """
 audit.py — Source-to-Kernel Provenance Audit for SimpleMLP (issue #2574).
 
-Runs ONE cache-defeated torch.compile under the in-process capture layer (pipeline/captures.py)
-and writes the raw captured
-structure to provenance_capture_raw.json for inspection on the device. The
-report/diagram layer (Phase B) is built against this verified dump.
+Runs ONE cache-defeated torch.compile under the in-process capture layer
+(pipeline/captures.py), writes the raw captured structure to
+provenance_capture_raw.json, then renders the Markdown report.
 
 Usage:
     python audit.py [--raw provenance_capture_raw.json]
@@ -112,7 +111,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 72)
-    print("  PROVENANCE CAPTURE (Phase A) — SimpleMLP")
+    print("  PROVENANCE AUDIT — SimpleMLP")
     print("  torch-spyre issue #2574")
     print("=" * 72)
     print(

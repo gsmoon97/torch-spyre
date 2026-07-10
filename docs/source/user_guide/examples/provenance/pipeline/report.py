@@ -28,10 +28,9 @@ from typing import Any
 
 # Field names come from the single source of truth in fields.py (shared with
 # captures.py) so the two layers can never drift.
-from .fields import FX_FIELDS, IR_FIELDS
+from .fields import FX_FIELDS, IR_FIELDS, source_loc_str
 
-# Matrix glyphs — plain text-class unicode, never emoji (emoji render as
-# colored glyphs that look AI-generated in the docs).
+# Matrix glyphs in plain text-class unicode.
 TICK = "✓"  # present & non-empty on all relevant nodes/ops (U+2713)
 PARTIAL = "◐"  # present on some (shown as n/total) (U+25D0)
 CROSS = "✗"  # measured empty/absent, i.e. dropped (U+2717)
@@ -77,6 +76,12 @@ _ORIGINS_CARRIES = frozenset(FX_FIELDS)
 # `ir_chain` (<- origins / origin_node). It does NOT retain nn_module_stack,
 # source_fn_stack, from_node or traceback -- those are genuinely dropped at the
 # OpSpec boundary, which is exactly what the audit must show.
+#
+# This set is derived BY HAND from build_debug_handle in #2945
+# (torch_spyre/_inductor/provenance.py); it is not measured from the run. If that
+# function changes which fields it copies into the handle, update this set to
+# match -- otherwise the carried/dropped (– / ✗) cells in the OpSpec and SuperDSC
+# columns will be wrong while still looking authoritative.
 _DEBUG_HANDLE_CARRIES = frozenset(
     {"stack_trace", "get_stack_traces", "original_aten", "origins", "origin_node"}
 )
@@ -193,21 +198,6 @@ def _opspec_symbol(ops: list[dict], field: str, opspec_fields: list[str]) -> str
     if present == 0:
         return CROSS
     return TICK if present == total else f"{PARTIAL} {present}/{total}"
-
-
-def _dh_source_str(dh: Any) -> str | None:
-    """Render a ``debug_handle`` payload's structured ``source`` as
-    ``basename:line`` (None when the handle has no resolvable source)."""
-    src = dh.get("source") if isinstance(dh, dict) else None
-    if not isinstance(src, dict):
-        return None
-    file = src.get("file")
-    start = src.get("start_line")
-    if not file or start is None:
-        return None
-    base = str(file).rsplit("/", 1)[-1]
-    end = src.get("end_line")
-    return f"{base}:{start}-{end}" if end and end != start else f"{base}:{start}"
 
 
 def _dh_fused_from_str(dh: Any) -> str:
@@ -498,7 +488,7 @@ def _lineage_section(
         "→ `permute` + `mm` + `add`); a **fan-in** is a fusion (several OpSpec "
         "ops → one kernel). An op with no source of its own attaches to every "
         "source-bearing producer whose buffer it consumes (multi-source). "
-        "Node/IR transformation only — field survival is the matrix above.",
+        "Node/IR transformation only — field survival is the matrix below.",
         "",
         *m,
         "",
@@ -534,6 +524,12 @@ def render(
         "cache-defeated `torch.compile`. Measurement-only — every table and the "
         "lineage graph below are computed from the captured compile-path objects.",
         "",
+        "This is a committed **example snapshot**: the `Generated` timestamp and "
+        "the `debug_handle` ids are specific to this run and machine (the id is a "
+        "content hash of the source location, which includes an absolute path), "
+        "so they change when regenerated — run `audit.py` to reproduce it for "
+        "your own setup.",
+        "",
     ]
 
     # Source → Kernel lineage graph first: the end-to-end transformation story.
@@ -557,7 +553,10 @@ def render(
         "",
         "Every column tests **population** (the field exists *and* carries "
         'non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do '
-        "not). These cells are measurements only.",
+        "not). Own-slot cells are measured directly; whether an absent field "
+        "reads *carried indirectly* (`–`) or *dropped* (`✗`) at the OpSpec / "
+        "SuperDSC columns is **derived** from what `debug_handle` retains, not "
+        "measured.",
         "",
         "The **Layer** column marks whether a field lives on the FX node (`FX`), "
         "the IR `ComputedBuffer` (`IR`), or the `debug_handle` (`Spyre`). The two "
@@ -792,7 +791,7 @@ def render(
                 continue
             op_keys = ", ".join(f"`{k}`" for k in f.get("op_keys", [])) or "—"
             aten = dh.get("aten_op")
-            src = _dh_source_str(dh)
+            src = source_loc_str(dh.get("source"))
             dh_id = dh.get("id")
             L.append(
                 f"| `{kname}` | `{f['file']}` | {op_keys} "

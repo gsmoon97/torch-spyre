@@ -1,12 +1,14 @@
 # Example Audit: `SimpleMLP` — Source-to-Kernel Provenance
 
-> Generated: 2026-07-08 15:28 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
+> Generated: 2026-07-14 18:01 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
 
 One worked example of the provenance audit (see the README for how to run it): `SimpleMLP` traced in-process through a single cache-defeated `torch.compile`. Measurement-only — every table and the lineage graph below are computed from the captured compile-path objects.
 
+This is a committed **example snapshot**: the `Generated` timestamp and the `debug_handle` ids are specific to this run and machine (the id is a content hash of the source location, which includes an absolute path), so they change when regenerated — run `audit.py` to reproduce it for your own setup.
+
 ## Source → Kernel Lineage
 
-How each source line flows through the pipeline — **Source → FX pre-grad → FX post-grad → LoopLevelIR pre-pass → LoopLevelIR post-pass → OpSpec → SuperDSC**. A **fan-out** is a decomposition (e.g. `linear` → `permute` + `mm` + `add`); a **fan-in** is a fusion (several OpSpec ops → one kernel). An op with no source of its own attaches to every source-bearing producer whose buffer it consumes (multi-source). Node/IR transformation only — field survival is the matrix above.
+How each source line flows through the pipeline — **Source → FX pre-grad → FX post-grad → LoopLevelIR pre-pass → LoopLevelIR post-pass → OpSpec → SuperDSC**. A **fan-out** is a decomposition (e.g. `linear` → `permute` + `mm` + `add`); a **fan-in** is a fusion (several OpSpec ops → one kernel). An op with no source of its own attaches to every source-bearing producer whose buffer it consumes (multi-source). Node/IR transformation only — field survival is the matrix below.
 
 ```mermaid
 flowchart LR
@@ -52,7 +54,6 @@ flowchart LR
   end
   subgraph sd_sg["SuperDSC"]
     sd_sdsc_fused_addmm_linear_relu_0["sdsc_fused_addmm_linear_relu_0"]
-    sd_sdsc_fused_addmm_1["sdsc_fused_addmm_1"]
   end
   src_x___self_fc1_x_ --> pg_x
   src_x___torch_relu_x_ --> pg_x_1
@@ -85,14 +86,14 @@ flowchart LR
   ops_op1 --> sd_sdsc_fused_addmm_linear_relu_0
   ops_op2 --> sd_sdsc_fused_addmm_linear_relu_0
   ops_op3 --> sd_sdsc_fused_addmm_linear_relu_0
-  ops_op4 --> sd_sdsc_fused_addmm_1
+  ops_op4 --> sd_sdsc_fused_addmm_linear_relu_0
 ```
 
 ## Stage × Field Matrix
 
 ✓ present & non-empty on **all** instances &nbsp; ◐ on some (n/total) &nbsp; ✗ reachable here but measured **empty/absent** (dropped) &nbsp; – not created yet here, **or** carried indirectly inside another field (see that field's row).
 
-Every column tests **population** (the field exists *and* carries non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do not). These cells are measurements only.
+Every column tests **population** (the field exists *and* carries non-empty content; `0` counts as content, `None`/`[]`/`{}`/`""` do not). Own-slot cells are measured directly; whether an absent field reads *carried indirectly* (`–`) or *dropped* (`✗`) at the OpSpec / SuperDSC columns is **derived** from what `debug_handle` retains, not measured.
 
 The **Layer** column marks whether a field lives on the FX node (`FX`), the IR `ComputedBuffer` (`IR`), or the `debug_handle` (`Spyre`). The two IR columns are the same LoopLevelIR before and after the Spyre pre-scheduling passes: **LoopLevelIR (pre-pass)** is the lowered IR entering them, **LoopLevelIR (post-pass)** is after they mutate it in place. These map to issue #2574's "Inductor passes" → "LoopLevelIR".
 
@@ -120,7 +121,7 @@ All observed `node.meta` keys: `['example_value', 'mutation_region_id', 'nn_modu
 | Node | target | `stack_trace` | `nn_module_stack` | `source_fn_stack` | `original_aten` | `from_node` | source line |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `x` | `<built-in function linear>` | `str` | `dict` | `list` | ✗ | ✗ | `x = self.fc1(x)` |
-| `x_1` | `<built-in method relu of type object at 0x7fb870ccd8a0>` | `str` | ✗ | `list` | ✗ | ✗ | `x = torch.relu(x)` |
+| `x_1` | `<built-in method relu of type object at 0x7fbb732c98a0>` | `str` | ✗ | `list` | ✗ | ✗ | `x = torch.relu(x)` |
 | `x_2` | `<built-in function linear>` | `str` | `dict` | `list` | ✗ | ✗ | `x = self.fc2(x)` |
 
 ## Stage 2b — FX Graph (post-grad): 7 compute nodes
@@ -189,7 +190,7 @@ Tracked fields: `origins` (FX nodes that lowered into this buffer), `origin_node
 | `batchmatmul` | `op3` | `mm_default`, `permute_1` | `mm_default` | `4917498687135836649` | `reference_mlp.py:27` |
 | `add` | `op4` | `add_tensor` | `add_tensor` | `6208522288796453179` | — |
 
-## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (2 kernels)
+## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (1 kernels)
 
 Each `OpSpec` is serialized to a `sdsc_*.json` kernel spec; the `debug_handle` travels with it (JSON key `debug_handle_`), resolving each kernel back to source.
 
@@ -201,24 +202,17 @@ All observed `debug_handle` keys: `['aten_op', 'fused_from', 'fusion_context', '
 
 | Kernel | `sdsc_*.json` | Spyre op | `aten_op` | source line | `fused_from` | `debug_handle` id |
 | --- | --- | --- | --- | --- | --- | --- |
-| `sdsc_fused_addmm_1` | `sdsc_0.json` | `0_add` | `aten.addmm.default` | — | — | `6208522288796453179` |
 | `sdsc_fused_addmm_linear_relu_0` | `sdsc_0.json` | `0_batchmatmul` | `aten.addmm.default` | `reference_mlp.py:25` | `aten.addmm.default`, `aten.linear.default` | `3841103980854345041` |
 | `sdsc_fused_addmm_linear_relu_0` | `sdsc_1.json` | `1_add` | `aten.addmm.default` | — | — | `605170506422197115` |
 | `sdsc_fused_addmm_linear_relu_0` | `sdsc_2.json` | `2_relufwd` | `aten.relu.default` | `reference_mlp.py:26` | — | `2003101464082329501` |
 | `sdsc_fused_addmm_linear_relu_0` | `sdsc_3.json` | `3_batchmatmul` | `aten.addmm.default` | `reference_mlp.py:27` | `aten.addmm.default`, `aten.linear.default` | `4917498687135836649` |
+| `sdsc_fused_addmm_linear_relu_0` | `sdsc_4.json` | `4_add` | `aten.addmm.default` | — | — | `6208522288796453179` |
 
 `fused_from` lists the constituent handles' ATen ops (MLIR `FusedLoc`-style lineage). A `—` source line means the handle resolves only to an ATen op (its FX node carried no `stack_trace`), not that the handle is absent.
 
 ### `sdsc_fused_addmm_linear_relu_0`
 
-- buffers (4): `op0`, `op1`, `op2`, `op3`
-- fx origins: `add_tensor_1`, `mm_default`, `mm_default_1`, `permute`, `permute_1`, `relu`
+- buffers (5): `op0`, `op1`, `op2`, `op3`, `op4`
+- fx origins: `add_tensor`, `add_tensor_1`, `mm_default`, `mm_default_1`, `permute`, `permute_1`, `relu`
 - kernel metadata: `# Topologically Sorted Source Nodes: [x, x_1, x_2], Original ATen: [aten.linear, aten.addmm, aten.relu]`
-- `sdsc_*.json` files: 4 &nbsp; `debug_handle_` non-null: 4/4
-
-### `sdsc_fused_addmm_1`
-
-- buffers (1): `op4`
-- fx origins: `add_tensor`
-- kernel metadata: `# Topologically Sorted Source Nodes: [], Original ATen: [aten.addmm]`
-- `sdsc_*.json` files: 1 &nbsp; `debug_handle_` non-null: 1/1
+- `sdsc_*.json` files: 5 &nbsp; `debug_handle_` non-null: 5/5

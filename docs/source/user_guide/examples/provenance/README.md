@@ -73,7 +73,7 @@ python audit.py --output /tmp/report.md --raw /tmp/raw.json
 
 Outputs:
 
-- **`provenance_audit.md`** — the measurement-only report (for [issue #2574](https://github.com/torch-spyre/torch-spyre/issues/2574)).
+- **`provenance_audit.md`** — the measurement-only report (for [issue #2574](https://github.com/torch-spyre/torch-spyre/issues/2574)). The committed copy is an **example snapshot**; its timestamp and `debug_handle` ids are specific to the run/machine, so regenerate with `audit.py` to reproduce for your own setup.
 - **`provenance_capture_raw.json`** — the full captured structure (every stage,
   every field, plus a `_hooks` block recording whether each hook installed and
   fired). Useful for verifying a run.

@@ -28,12 +28,11 @@ the duration of one ``torch.compile``:
     Stage 6 SuperDSC      SuperDSCScheduling.define_kernel +        [scheduler.py]
                           async_compile.get_output_dir (exact dirs) [async_compile.py]
 
-DESIGN NOTE — this is Phase A (capture only). Each hook is wrapped in its own
-try/except and records whether it fired and any error, so a signature mismatch
-on a given torch build degrades to missing data (visible in the dump) rather
-than crashing the whole audit. Field locations / signatures here are derived
-from source reading and MUST be confirmed against the pinned torch build via
-the raw dump before the report layer (Phase B) is built on top.
+DESIGN NOTE — capture only. Each hook is wrapped in its own try/except and
+records whether it fired and any error, so a signature mismatch on a given torch
+build degrades to missing data (visible in the dump) rather than crashing the
+whole audit. Field locations / signatures here are derived from source reading
+and confirmed against the pinned torch build via the raw dump.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ from typing import Any
 # and report layers can never drift. FX_META_FIELDS is the same list the report
 # calls FX_FIELDS.
 from .fields import FX_FIELDS as FX_META_FIELDS
-from .fields import OPSPEC_PROVENANCE_FIELDS
+from .fields import OPSPEC_PROVENANCE_FIELDS, is_populated, source_loc_str
 
 _MAX = 200  # repr truncation
 
@@ -55,17 +54,6 @@ def _safe(obj: Any) -> str:
         return str(obj)[:_MAX]
     except Exception as e:  # pragma: no cover - defensive
         return f"<unrepr-able {type(obj).__name__}: {e}>"
-
-
-def _is_populated(val: Any) -> bool:
-    """A provenance value counts as carried only if non-empty: ``0`` is
-    populated (a valid handle); ``None`` / empty collection / ``""`` are not.
-    This is the shared population rule used at every stage."""
-    if val is None:
-        return False
-    if isinstance(val, (list, tuple, set, dict, str)) and len(val) == 0:
-        return False
-    return True
 
 
 def _first_source_line(stack_trace: Any) -> str | None:
@@ -96,7 +84,7 @@ def _summarize_fx_meta(node: Any) -> dict:
         rec = {
             "type": type(val).__name__,
             "repr": _safe(val),
-            "nonempty": _is_populated(val),
+            "nonempty": is_populated(val),
         }
         if field == "stack_trace":
             rec["source_line"] = _first_source_line(val)
@@ -176,26 +164,7 @@ def _summarize_ir_attrs(op: Any) -> dict:
 def _opspec_field_present(op_spec: Any, name: str) -> bool:
     """Is provenance field ``name`` declared AND populated on this OpSpec
     instance? (Existence + the shared non-empty rule.)"""
-    return hasattr(op_spec, name) and _is_populated(getattr(op_spec, name))
-
-
-def _source_loc_str(src: Any) -> str | None:
-    """Render a structured ``SourceLoc`` dict as ``basename:line`` for display.
-
-    Returns None when there is no resolvable source (``source`` is null, or the
-    handle points only at an ATen op). Handles an optional ``end_line`` so a
-    future multi-line range renders as ``basename:line-endline`` without a code
-    change here.
-    """
-    if not isinstance(src, dict):
-        return None
-    file = src.get("file")
-    start = src.get("start_line")
-    if not file or start is None:
-        return None
-    base = str(file).rsplit("/", 1)[-1]
-    end = src.get("end_line")
-    return f"{base}:{start}-{end}" if end and end != start else f"{base}:{start}"
+    return hasattr(op_spec, name) and is_populated(getattr(op_spec, name))
 
 
 def _summarize_debug_handle(dh: Any) -> dict | None:
@@ -217,7 +186,7 @@ def _summarize_debug_handle(dh: Any) -> dict | None:
     if not isinstance(d, dict):
         return {"repr": _safe(dh)}
     rec = dict(d)  # full DebugHandle schema, verbatim
-    rec["source_line"] = _source_loc_str(d.get("source"))
+    rec["source_line"] = source_loc_str(d.get("source"))
     return rec
 
 

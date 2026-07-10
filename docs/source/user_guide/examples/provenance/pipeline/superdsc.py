@@ -33,6 +33,8 @@ import json
 import pathlib
 from typing import Any
 
+from .fields import is_populated
+
 # Provenance field names we scan the serialized SDSC JSON for (issue #2574).
 # The first six are PyTorch's real FX node.meta / Inductor IR provenance keys.
 # "debug_handle_" (trailing underscore) is the real key Phase 2a (#2575) now
@@ -43,10 +45,10 @@ from typing import Any
 PROVENANCE_FIELD_NAMES = [
     "stack_trace",  # FX meta
     "original_aten",  # FX meta
-    "from_node",  # IR attribute
+    "from_node",  # FX meta
     "origins",  # IR attribute
     "origin_node",  # IR attribute
-    "traceback",  # FX meta
+    "traceback",  # IR attribute
     "provenance",  # forward-looking
     "debug_handle_",  # Phase 2a: the real serialized key
 ]
@@ -73,17 +75,6 @@ def _extract_debug_handle(obj: Any) -> tuple[bool, Any]:
     return False, None
 
 
-def _is_populated(val: Any) -> bool:
-    """A provenance value counts as carried only if non-empty: ``0`` is
-    populated (a valid handle); ``None`` / empty collection / ``""`` are not.
-    Matches the population rule used at every other stage."""
-    if val is None:
-        return False
-    if isinstance(val, (list, tuple, set, dict, str)) and len(val) == 0:
-        return False
-    return True
-
-
 def _scan_json_for_provenance(obj: Any) -> dict[str, bool]:
     # Population, not mere key presence: a key whose value is null/empty does
     # NOT count (a serialized "debug_handle": null is not carried provenance).
@@ -92,7 +83,7 @@ def _scan_json_for_provenance(obj: Any) -> dict[str, bool]:
     def walk(o):
         if isinstance(o, dict):
             for k, v in o.items():
-                if k in found and _is_populated(v):
+                if k in found and is_populated(v):
                     found[k] = True
                 walk(v)
         elif isinstance(o, list):
@@ -129,7 +120,7 @@ def read_bundle(kernel_name: str, output_dir: str) -> dict[str, Any]:
             continue
         hits = _scan_json_for_provenance(data)
         dh_present, dh_value = _extract_debug_handle(data)
-        dh_nonnull = dh_present and _is_populated(dh_value)
+        dh_nonnull = dh_present and is_populated(dh_value)
         rec["sdsc_files"].append(
             {
                 "file": jf.name,
