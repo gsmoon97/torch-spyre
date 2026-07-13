@@ -37,6 +37,7 @@ from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
+from .provenance import SpyreGraphTransformObserver
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
@@ -178,6 +179,9 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if not self._has_spyre_device(graph):
             return
+        # FX-graph passes are already observed by upstream Inductor's
+        # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
+        # observer is wrapped here.
         for p in self.passes:
             p(graph)
 
@@ -198,7 +202,15 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         if not self._has_spyre_device(target):
             return target
         for pass_fn in self.passes:
-            target = pass_fn(target)
+            name = getattr(pass_fn, "__name__", type(pass_fn).__name__)
+            # The observer snapshots the list it is given at __enter__; these
+            # passes regroup SchedulerNodes while the underlying
+            # ComputedBuffers persist, so in-place origin drops are detected.
+            # A pass that returns an entirely new list is simply not
+            # re-examined (no false positive) -- the load-bearing detection
+            # is on the GraphLowering pipeline below.
+            with SpyreGraphTransformObserver(target, name, kind="node"):
+                target = pass_fn(target)
         return target
 
     def uuid(self) -> Any | None:
@@ -382,16 +394,22 @@ class CustomPreSchedulingPasses:
             )
 
         for pass_fn in self.passes:
-            t0 = time.perf_counter()
-            pass_fn(graph)
+            name = getattr(pass_fn, "__name__", type(pass_fn).__name__)
+            # `graph` is the same object throughout -- passes mutate
+            # `graph.operations` in place -- so before/after reconciliation
+            # is exact here.
+            with SpyreGraphTransformObserver(graph, name, kind="graphlowering"):
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "elapsed %5dms  %s",
-                    (time.perf_counter() - t0) * 1000,
-                    _get_pass_name(pass_fn),
+                    elapsed_ms,
+                    pass_name,
                 )
-
-            pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
                 logger.debug(
                     "AFTER %s\n%s", pass_name, _format_operations(graph.operations)

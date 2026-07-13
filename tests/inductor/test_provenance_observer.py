@@ -146,3 +146,38 @@ class TestObserverDetection:
         # Enumeration failure must not propagate.
         with SpyreGraphTransformObserver(object(), "weird_target", kind="node"):
             pass
+
+
+class TestPipelineWrapping:
+    def test_node_pipeline_observes_each_pass(self, recwarn):
+        from torch_spyre._inductor.passes import _SpyreNodePassPipeline
+
+        def dropping_node_pass(nodes):
+            for n in nodes:
+                n.node.origins = set()  # wrongly clears provenance
+            return nodes
+
+        pipeline = _SpyreNodePassPipeline([dropping_node_pass])
+        # Force the device guard on so the loop body runs off-device.
+        pipeline._has_spyre_device = lambda target: True
+        pipeline([_unit(_Buf(origins={"a"}))])
+        assert any("dropping_node_pass" in str(w.message) for w in recwarn.list)
+
+    def test_graphlowering_pipeline_observes_each_pass(self, recwarn, monkeypatch):
+        import torch_spyre._inductor.passes as passes_mod
+
+        class _FakeGraph:
+            def __init__(self, ops):
+                self.operations = ops
+
+        def dropping_gl_pass(graph):
+            for op in graph.operations:
+                op.origins = set()
+
+        monkeypatch.setattr(
+            passes_mod, "_operations_have_spyre_device", lambda ops: True
+        )
+        pipeline = passes_mod.CustomPreSchedulingPasses()
+        pipeline.passes = [dropping_gl_pass]
+        pipeline(_FakeGraph([_Buf(origins={"a"})]))
+        assert any("dropping_gl_pass" in str(w.message) for w in recwarn.list)
