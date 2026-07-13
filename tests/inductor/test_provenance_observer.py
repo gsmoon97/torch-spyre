@@ -21,6 +21,7 @@ from torch_spyre._inductor.provenance import (
     preserve_provenance,
     merge_provenance,
     decompose_provenance,
+    SpyreGraphTransformObserver,
 )
 
 
@@ -92,3 +93,56 @@ class TestDecomposeProvenance:
         decompose_provenance(old, [c0, c1], context="split_multi_ops")
         c0.origins.add("x")
         assert c1.origins == {"a"}
+
+
+class _NodeListTarget(list):
+    """Stand-in for list[BaseSchedulerNode]; each unit's buffer is .node."""
+
+
+def _unit(buf):
+    class _N:
+        def __init__(self, b):
+            self.node = b
+
+    return _N(buf)
+
+
+class TestObserverDetection:
+    def test_regression_warns(self, recwarn):
+        b = _Buf(origins={"a"})
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "bad_pass_regress", kind="node"):
+            b.origins = set()  # pass wrongly drops provenance
+        assert any("bad_pass_regress" in str(w.message) for w in recwarn.list)
+
+    def test_preserved_no_warning(self, recwarn):
+        b = _Buf(origins={"a"})
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "good_pass_keep", kind="node"):
+            pass  # no change
+        assert not [w for w in recwarn.list if "good_pass_keep" in str(w.message)]
+
+    def test_new_unattributed_buffer_warns(self, recwarn):
+        target = _NodeListTarget([])
+        with SpyreGraphTransformObserver(target, "creates_bare_buf", kind="node"):
+            target.append(_unit(_Buf(origins=set())))
+        assert any("creates_bare_buf" in str(w.message) for w in recwarn.list)
+
+    def test_allowlisted_new_buffer_silent(self, recwarn):
+        target = _NodeListTarget([])
+        with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
+            target.append(_unit(_Buf(origins=set())))  # source-less by design
+        assert not recwarn.list
+
+    def test_disabled_by_env(self, recwarn, monkeypatch):
+        monkeypatch.setenv("TORCH_SPYRE_PROVENANCE", "0")
+        b = _Buf(origins={"a"})
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "bad_pass_env", kind="node"):
+            b.origins = set()
+        assert not recwarn.list
+
+    def test_never_raises_on_bad_target(self):
+        # Enumeration failure must not propagate.
+        with SpyreGraphTransformObserver(object(), "weird_target", kind="node"):
+            pass

@@ -23,6 +23,8 @@ reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 from __future__ import annotations
 
 import hashlib
+import os
+import warnings
 from typing import Any, Sequence
 
 import regex
@@ -237,3 +239,113 @@ def decompose_provenance(old: Any, news: Sequence[Any], context: str) -> None:
         if node is not None and getattr(child, "origin_node", None) is None:
             child.origin_node = node
         setattr(child, _SPYRE_PROV_CONTEXT_ATTR, context)
+
+
+# Passes whose newly-created buffers are legitimately source-less (compiler-
+# generated, analogous to LLVM getCompilerGenerated) -> honest-empty, not warned.
+# Keep conservative; add a pass here only after confirming its new buffers have
+# no user-source origin by design.
+COMPILER_GENERATED_PASSES = frozenset(
+    {
+        "insert_restickify",
+        "insert_post_mutation_restickify",
+        "insert_bmm_padding",
+        "dedup_and_promote_constants",
+    }
+)
+
+# Warn at most once per pass name per process to avoid log spam.
+_warned_passes: set = set()
+
+
+def _provenance_enabled() -> bool:
+    return os.environ.get("TORCH_SPYRE_PROVENANCE", "1") != "0"
+
+
+def _iter_prov_units(target: Any, kind: str) -> list:
+    """Best-effort enumeration of provenance-bearing buffers in a pass target.
+
+    kind == "graphlowering": target is a GraphLowering; its ``operations`` are
+      ir.Operation/ComputedBuffer nodes that carry ``origins``.
+    kind == "node": target is a list[BaseSchedulerNode]; the buffer is ``.node``.
+    Any other kind (e.g. FX "graph", already observed upstream) yields nothing.
+    """
+    units: list = []
+    try:
+        if kind == "graphlowering":
+            for op in getattr(target, "operations", []) or []:
+                units.append(op)
+        elif kind == "node":
+            for n in target or []:
+                buf = getattr(n, "node", None)
+                units.append(buf if buf is not None else n)
+    except Exception:
+        return []
+    return [u for u in units if u is not None]
+
+
+def _origins_of(unit: Any) -> frozenset:
+    return frozenset(getattr(unit, "origins", None) or ())
+
+
+class SpyreGraphTransformObserver:
+    """Detects provenance (``origins``) dropped by a Spyre pass.
+
+    Context manager wrapping one pass. On exit it compares each buffer's
+    ``origins`` against a pre-pass snapshot and warns once per pass when an
+    existing buffer's origins were cleared, or a new buffer was created without
+    origins and its pass is not in ``COMPILER_GENERATED_PASSES``. Best-effort:
+    never raises into the compile path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
+
+    It does NOT forward provenance or set fusion context — that is the job of the
+    preserve/merge/decompose helpers and the existing buffer-reconstruction path.
+    """
+
+    def __init__(self, target: Any, pass_name: str, kind: str) -> None:
+        self.target = target
+        self.pass_name = pass_name
+        self.kind = kind
+        self._before: dict[int, frozenset] = {}
+        self._active = _provenance_enabled() and kind != "graph"
+
+    def __enter__(self) -> "SpyreGraphTransformObserver":
+        if not self._active:
+            return self
+        try:
+            for u in _iter_prov_units(self.target, self.kind):
+                self._before[id(u)] = _origins_of(u)
+        except Exception:
+            self._active = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Reconcile only on clean pass exit; never suppress a real exception.
+        if not self._active or exc_type is not None:
+            return
+        try:
+            self._reconcile()
+        except Exception:
+            pass  # provenance is best-effort
+
+    def _reconcile(self) -> None:
+        for u in _iter_prov_units(self.target, self.kind):
+            before = self._before.get(id(u))
+            now = _origins_of(u)
+            if before is not None:
+                if before and not now:
+                    self._warn("dropped provenance on an existing buffer")
+            elif not now and self.pass_name not in COMPILER_GENERATED_PASSES:
+                self._warn(
+                    "created a buffer without provenance; use "
+                    "preserve_/merge_/decompose_provenance"
+                )
+
+    def _warn(self, msg: str) -> None:
+        if self.pass_name in _warned_passes:
+            return
+        _warned_passes.add(self.pass_name)
+        warnings.warn(
+            f"[spyre-provenance] pass '{self.pass_name}' {msg}. "
+            f"Provenance may be lost for affected kernels.",
+            stacklevel=2,
+        )
