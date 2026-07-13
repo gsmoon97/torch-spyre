@@ -23,7 +23,7 @@ reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, Sequence
 
 import regex
 
@@ -184,3 +184,56 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
         fused_from=fused_from,
         fusion_context=getattr(buffer, _SPYRE_PROV_CONTEXT_ATTR, None),
     )
+
+
+def _union_origins(src: Any, dst: Any) -> None:
+    """Union src's origins into dst's origins in place.
+
+    ``origins`` is a mutable ``OrderedSet`` on Buffer/ComputedBuffer; unioning
+    in place (as graph_editor and Inductor lowering do) preserves the container
+    type and any origins dst already accumulated, rather than rebinding the
+    field to a plain ``set``.
+    """
+    src_origins = getattr(src, "origins", None)
+    dst_origins = getattr(dst, "origins", None)
+    if src_origins and dst_origins is not None:
+        dst_origins.update(src_origins)
+
+
+def preserve_provenance(old: Any, new: Any) -> None:
+    """1:1 rewrite: carry origins/origin_node/context from old onto new.
+
+    Targets Buffer/ComputedBuffer, which are ``@ir_dataclass(frozen=False)``, so
+    scalar fields use plain assignment (as ``replace_computed_buffer_body`` /
+    ``copy_op_metadata`` do). ``origins`` is unioned in place. Scalars are set
+    only when unset on new, so a pass that already populated them is not
+    clobbered. Best-effort is a boundary concern (the observer / create_op_spec
+    already wrap calls in try/except); no per-write guard here.
+    """
+    _union_origins(old, new)
+    node = getattr(old, "origin_node", None)
+    if node is not None and getattr(new, "origin_node", None) is None:
+        new.origin_node = node
+    ctx = getattr(old, _SPYRE_PROV_CONTEXT_ATTR, None)
+    if ctx is not None:
+        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, ctx)
+
+
+def merge_provenance(sources: Sequence[Any], new: Any, context: str) -> None:
+    """n->1 fusion: union all sources' origins onto new; record context."""
+    for s in sources:
+        _union_origins(s, new)
+    setattr(new, _SPYRE_PROV_CONTEXT_ATTR, context)
+
+
+def decompose_provenance(old: Any, news: Sequence[Any], context: str) -> None:
+    """1->n decomposition: each child inherits old's origins/node; record context.
+
+    Each child unions old's origins into its own (independent) origins set.
+    """
+    node = getattr(old, "origin_node", None)
+    for child in news:
+        _union_origins(old, child)
+        if node is not None and getattr(child, "origin_node", None) is None:
+            child.origin_node = node
+        setattr(child, _SPYRE_PROV_CONTEXT_ATTR, context)
