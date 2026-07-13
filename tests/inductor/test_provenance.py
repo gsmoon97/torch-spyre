@@ -257,6 +257,23 @@ class TestBuildDebugHandle:
         assert h1.ir_chain == h2.ir_chain
         assert h1.id == h2.id
 
+    def test_reads_fusion_context_annotation(self):
+        # The SpyreGraphTransformObserver / provenance helpers stamp this
+        # private attr on a ComputedBuffer during pass rewrites;
+        # build_debug_handle must fold it into DebugHandle.fusion_context.
+        from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR
+
+        n = _node("mm", "/m.py", 5, "aten.mm.default")
+        buf = _buffer([n])
+        setattr(buf, _SPYRE_PROV_CONTEXT_ATTR, "spyre_fuse_nodes")
+        handle = build_debug_handle(buf)
+        assert handle is not None
+        assert handle.fusion_context == "spyre_fuse_nodes"
+
+    def test_fusion_context_absent_is_none(self):
+        n = _node("mm", "/m.py", 5, "aten.mm.default")
+        assert build_debug_handle(_buffer([n])).fusion_context is None
+
 
 class TestOpSpecDebugHandle:
     def _make(self, **kw):

@@ -32,6 +32,12 @@ from torch_spyre._inductor.op_spec import DebugHandle, SourceLoc
 
 _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
 
+# Buffer attribute the SpyreGraphTransformObserver / provenance helpers stamp
+# with the pass-level fusion or decomposition context (a FusedLoc-style metadata
+# tag). Carried across pass rewrites via loop_info._SPYRE_METADATA_ATTRS and
+# folded into DebugHandle.fusion_context by build_debug_handle.
+_SPYRE_PROV_CONTEXT_ATTR = "_spyre_prov_context"
+
 
 def _stable_id(
     source: SourceLoc | None,
@@ -176,4 +182,5 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
         aten_op=aten_op,
         ir_chain=ir_chain,
         fused_from=fused_from,
+        fusion_context=getattr(buffer, _SPYRE_PROV_CONTEXT_ATTR, None),
     )

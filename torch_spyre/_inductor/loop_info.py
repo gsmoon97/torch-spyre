@@ -23,6 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR
+
 if TYPE_CHECKING:
     import sympy
     from torch._inductor.ir import ComputedBuffer
@@ -69,6 +71,10 @@ _SPYRE_METADATA_ATTRS = (
     "_restickify_plan",
     "_input_layout_overrides",
     "_emit_set_layout",
+    # Pass-level fusion/decomposition context (set by the
+    # SpyreGraphTransformObserver / provenance helpers); read by
+    # provenance.build_debug_handle into DebugHandle.fusion_context.
+    _SPYRE_PROV_CONTEXT_ATTR,
 )
 
 
