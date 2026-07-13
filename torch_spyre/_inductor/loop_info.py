@@ -23,7 +23,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+
 import sympy
+
+from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR
 
 if TYPE_CHECKING:
     from torch._inductor.ir import ComputedBuffer
@@ -103,6 +106,10 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
+    # Pass-level fusion/decomposition context (set by the
+    # SpyreGraphTransformObserver / provenance helpers); read by
+    # provenance.build_debug_handle into DebugHandle.fusion_context.
+    _SPYRE_PROV_CONTEXT_ATTR,
 )
 
 
