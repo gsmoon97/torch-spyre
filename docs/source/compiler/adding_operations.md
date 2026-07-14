@@ -96,3 +96,42 @@ Canonical implementations: `NameSwapHandler` in
 [insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py),
 `_SplitOpsHandler` and `_IntermediateOpHandler` in
 [split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py).
+
+## Preserving provenance in passes
+
+Every op carries a `debug_handle`, built at codegen from the buffer's `origins`,
+that ties the emitted kernel back to a source line (and, once profiler
+integration lands, a profiler event). A pass that creates or rewrites a
+`ComputedBuffer` must carry `origins` (and `origin_node`) onto the new buffer, or
+that op's `debug_handle` will have no source.
+
+Reuse the existing helpers rather than setting `origins` by hand:
+
++ `replace_computed_buffer_body(op, new_data, operations)` in
+  [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
+  when reconstructing a buffer's body: it forwards `operation_name`, `origins`,
+  and `origin_node`.
++ `copy_op_metadata(src, dst)` in
+  [loop_info.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/loop_info.py)
+  to carry Spyre metadata (including the fusion-context tag) across a
+  reconstructed buffer.
++ `preserve_provenance`, `merge_provenance`, and `decompose_provenance` in
+  [provenance.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/provenance.py)
+  at explicit rewrite sites:
+  + `preserve_provenance(old, new)` for a 1-to-1 rewrite,
+  + `merge_provenance(sources, new, context)` when fusing several buffers into one
+    (unions their `origins` and records why),
+  + `decompose_provenance(old, news, context)` when splitting one buffer into many
+    (each output inherits the parent's `origins`).
+
+`SpyreGraphTransformObserver` wraps every pass in the node and pre-scheduling
+pipelines and emits a warning when a pass clears an existing buffer's `origins` or
+creates a buffer without any. If you add a pass and see a
+`[spyre-provenance] pass '<name>' ...` warning, forward provenance with one of the
+helpers above.
+
+Some passes legitimately create buffers with no user source (for example padding
+via `constant_pad_nd`). Those pass names are listed in `COMPILER_GENERATED_PASSES`
+in `provenance.py` and are not warned; add a pass there only after confirming its
+new buffers genuinely have no source. Set `TORCH_SPYRE_PROVENANCE=0` to disable
+the observer entirely.
