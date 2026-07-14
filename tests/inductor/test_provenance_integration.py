@@ -104,3 +104,15 @@ def test_handles_survive_real_compile(monkeypatch):
     # The resolved source should point at this test module (the model's forward).
     this_file = os.path.basename(__file__)
     assert any(h.source.file.endswith(this_file) for h in resolved)
+
+    # (c) A fused op's handle references all its constituent sources via
+    #     fused_from. Each linear lowers to permute + mm fused into one buffer,
+    #     so its handle carries a multi-entry fused_from, at least one entry of
+    #     which resolves back to the model source line.
+    fused = [h for h in collected if h is not None and len(h.fused_from) >= 2]
+    assert fused, "no fused handle with a multi-source fused_from was produced"
+    assert any(
+        c.source is not None and c.source.file.endswith(this_file)
+        for h in fused
+        for c in h.fused_from
+    ), "fused_from did not carry the constituent source line"
