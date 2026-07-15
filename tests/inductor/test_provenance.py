@@ -274,6 +274,19 @@ class TestBuildDebugHandle:
         n = _node("mm", "/m.py", 5, "aten.mm.default")
         assert build_debug_handle(_buffer([n])).fusion_context is None
 
+    def test_single_origin_no_trace_is_honest_empty(self):
+        # A single compiler-generated origin with no stack_trace and no
+        # origin_node (e.g. a synthesized node with no user source line): the
+        # source is honestly None rather than guessed, but original_aten still
+        # yields aten_op, and ir_chain remains valid. Not a fusion (one origin),
+        # so fused_from stays empty.
+        n = _node("synthetic", aten="aten.clone.default")
+        h = build_debug_handle(_buffer([n], name="op3"))
+        assert h.source is None
+        assert h.aten_op == "aten.clone.default"
+        assert h.ir_chain == ("synthetic", "op3")
+        assert h.fused_from == ()
+
 
 class TestOpSpecDebugHandle:
     def _make(self, **kw):
