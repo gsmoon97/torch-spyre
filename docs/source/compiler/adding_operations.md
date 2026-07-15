@@ -99,11 +99,14 @@ Canonical implementations: `NameSwapHandler` in
 
 ## Preserving provenance in passes
 
-Every op carries a `debug_handle`, built at codegen from the buffer's `origins`,
-that ties the emitted kernel back to a source line (and, once profiler
-integration lands, a profiler event). A pass that creates or rewrites a
-`ComputedBuffer` must carry `origins` (and `origin_node`) onto the new buffer, or
-that op's `debug_handle` will have no source.
+Each op's `debug_handle` is built at codegen from the buffer's `origins`, tying
+the emitted kernel back to its source (and, once profiler integration lands, a
+profiler event). The handle is only as good as the buffer's provenance: a buffer
+with no `origins` gets no handle at all, and one whose `origins` carry no stack
+trace gets a handle with no source line. A pass that creates or rewrites a
+`ComputedBuffer` must carry `origins` (and `origin_node`, which is authoritative
+for the handle's source) onto the new buffer, or that op loses its source
+attribution.
 
 Reuse the existing helpers rather than setting `origins` by hand:
 
@@ -125,13 +128,16 @@ Reuse the existing helpers rather than setting `origins` by hand:
     (each output inherits the parent's `origins`).
 
 `SpyreGraphTransformObserver` wraps every pass in the node and pre-scheduling
-pipelines and emits a warning when a pass clears an existing buffer's `origins` or
-creates a buffer without any. If you add a pass and see a
-`[spyre-provenance] pass '<name>' ...` warning, forward provenance with one of the
-helpers above.
+pipelines and emits a warning when a pass drops any of an existing buffer's
+`origins` (even a partial loss, such as a fused buffer going from two sources to
+one), clears its `origin_node`, or creates a buffer with no provenance at all. If
+you add a pass and see a `[spyre-provenance] pass '<name>' ...` warning, forward
+provenance with one of the helpers above.
 
-Some passes legitimately create buffers with no user source (for example padding
-via `constant_pad_nd`). Those pass names are listed in `COMPILER_GENERATED_PASSES`
-in `provenance.py` and are not warned; add a pass there only after confirming its
-new buffers genuinely have no source. Set `TORCH_SPYRE_PROVENANCE=0` to disable
-the observer entirely.
+Some passes legitimately create source-less buffers (for example padding via
+`constant_pad_nd`) or rebuild and remap a buffer's provenance as part of their
+job. Those pass names are listed in `COMPILER_GENERATED_PASSES` in `provenance.py`
+and are exempt from all of these warnings (partial or complete `origins` loss,
+`origin_node` loss, and source-less creation); add a pass there only after
+confirming its provenance changes are intentional. Set `TORCH_SPYRE_PROVENANCE=0`
+to disable the observer entirely.
