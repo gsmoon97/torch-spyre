@@ -256,8 +256,19 @@ COMPILER_GENERATED_PASSES = frozenset(
     }
 )
 
-# Warn at most once per pass name per process to avoid log spam.
+# Warn at most once per pass name per compile to avoid log spam. Reset by the
+# Spyre pass pipelines at the start of each run via reset_provenance_warnings().
 _warned_passes: set = set()
+
+
+def reset_provenance_warnings() -> None:
+    """Clear the per-pass warning dedup.
+
+    Called by the Spyre pass pipelines at the start of each run so the observer's
+    "warn once per pass" behavior is per-compile, not per-process: a later compile
+    that hits the same regression must warn again.
+    """
+    _warned_passes.clear()
 
 
 def _provenance_enabled() -> bool:

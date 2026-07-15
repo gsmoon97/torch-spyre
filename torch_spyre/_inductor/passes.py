@@ -37,7 +37,7 @@ from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
-from .provenance import SpyreGraphTransformObserver
+from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
@@ -201,6 +201,9 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
     def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if not self._has_spyre_device(target):
             return target
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
         for pass_fn in self.passes:
             name = getattr(pass_fn, "__name__", type(pass_fn).__name__)
             # The observer snapshots the list it is given at __enter__; these
@@ -387,6 +390,10 @@ class CustomPreSchedulingPasses:
     def __call__(self, graph: GraphLowering) -> None:
         if not _operations_have_spyre_device(graph.operations):
             return
+
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
