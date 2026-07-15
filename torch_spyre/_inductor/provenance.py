@@ -341,7 +341,7 @@ class SpyreGraphTransformObserver:
         self.target = target
         self.pass_name = pass_name
         self.kind = kind
-        self._before: dict[Any, frozenset] = {}
+        self._before: dict[Any, tuple[frozenset, Any]] = {}
         self._active = _provenance_enabled() and kind != "graph"
 
     def __enter__(self) -> "SpyreGraphTransformObserver":
@@ -349,7 +349,10 @@ class SpyreGraphTransformObserver:
             return self
         try:
             for u in _iter_prov_units(self.target, self.kind):
-                self._before[_unit_key(u)] = _origins_of(u)
+                self._before[_unit_key(u)] = (
+                    _origins_of(u),
+                    getattr(u, "origin_node", None),
+                )
         except Exception:
             self._active = False
         return self
@@ -366,9 +369,10 @@ class SpyreGraphTransformObserver:
     def _reconcile(self) -> None:
         exempt = self.pass_name in COMPILER_GENERATED_PASSES
         for u in _iter_prov_units(self.target, self.kind):
-            before = self._before.get(_unit_key(u))
+            snap = self._before.get(_unit_key(u))
             now = _origins_of(u)
-            if before is not None:
+            if snap is not None:
+                before, before_node = snap
                 # Warn on ANY lost origin, not only a complete drop: a fused
                 # buffer going {a, b} -> {a} silently loses one source. A pass
                 # that legitimately remaps origins can be added to
@@ -378,6 +382,14 @@ class SpyreGraphTransformObserver:
                     self._warn(
                         f"dropped {len(lost)} of {len(before)} provenance "
                         f"origin(s) on an existing buffer"
+                    )
+                # origin_node is authoritative for handle source/aten; a pass
+                # that had one and cleared it silently loses attribution.
+                now_node = getattr(u, "origin_node", None)
+                if before_node is not None and now_node is None and not exempt:
+                    self._warn(
+                        "dropped origin_node (authoritative provenance) on an "
+                        "existing buffer"
                     )
             elif not now and not exempt:
                 self._warn(
