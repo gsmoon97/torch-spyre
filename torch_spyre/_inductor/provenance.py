@@ -24,15 +24,21 @@ from __future__ import annotations
 
 import hashlib
 import os
-import warnings
 from typing import Any, Sequence
 
 import regex
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import DebugHandle, SourceLoc
 
 
 _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
+
+# Named "provenance" so drop warnings are on logger "spyre.inductor.provenance":
+# unlike warnings.warn, a logger call has no per-process dedup registry, so the
+# per-compile reset in reset_provenance_warnings() genuinely re-emits on a later
+# compile that hits the same regression.
+logger = get_inductor_logger("provenance")
 
 # Buffer attribute the SpyreGraphTransformObserver / provenance helpers stamp
 # with the pass-level fusion or decomposition context (a FusedLoc-style metadata
@@ -367,8 +373,7 @@ class SpyreGraphTransformObserver:
         if self.pass_name in _warned_passes:
             return
         _warned_passes.add(self.pass_name)
-        warnings.warn(
+        logger.warning(
             f"[spyre-provenance] pass '{self.pass_name}' {msg}. "
-            f"Provenance may be lost for affected kernels.",
-            stacklevel=2,
+            f"Provenance may be lost for affected kernels."
         )
