@@ -241,10 +241,12 @@ def decompose_provenance(old: Any, news: Sequence[Any], context: str) -> None:
         setattr(child, _SPYRE_PROV_CONTEXT_ATTR, context)
 
 
-# Passes whose newly-created buffers are legitimately source-less (compiler-
-# generated, analogous to LLVM getCompilerGenerated) -> honest-empty, not warned.
+# Passes exempted from provenance warnings: their newly-created buffers are
+# legitimately source-less (compiler-generated, analogous to LLVM
+# getCompilerGenerated) -> honest-empty, not warned, OR they legitimately
+# remap an existing buffer's origins and so may lose some without warning.
 # Keep conservative; add a pass here only after confirming its new buffers have
-# no user-source origin by design.
+# no user-source origin by design, or its origin remapping is intentional.
 COMPILER_GENERATED_PASSES = frozenset(
     {
         "insert_restickify",
@@ -293,9 +295,10 @@ class SpyreGraphTransformObserver:
 
     Context manager wrapping one pass. On exit it compares each buffer's
     ``origins`` against a pre-pass snapshot and warns once per pass when an
-    existing buffer's origins were cleared, or a new buffer was created without
-    origins and its pass is not in ``COMPILER_GENERATED_PASSES``. Best-effort:
-    never raises into the compile path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
+    existing buffer's origins were cleared or partially dropped, or a new
+    buffer was created without origins, and its pass is not in
+    ``COMPILER_GENERATED_PASSES``. Best-effort: never raises into the compile
+    path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
 
     It does NOT forward provenance or set fusion context — that is the job of the
     preserve/merge/decompose helpers and the existing buffer-reconstruction path.
@@ -328,13 +331,22 @@ class SpyreGraphTransformObserver:
             pass  # provenance is best-effort
 
     def _reconcile(self) -> None:
+        exempt = self.pass_name in COMPILER_GENERATED_PASSES
         for u in _iter_prov_units(self.target, self.kind):
             before = self._before.get(id(u))
             now = _origins_of(u)
             if before is not None:
-                if before and not now:
-                    self._warn("dropped provenance on an existing buffer")
-            elif not now and self.pass_name not in COMPILER_GENERATED_PASSES:
+                # Warn on ANY lost origin, not only a complete drop: a fused
+                # buffer going {a, b} -> {a} silently loses one source. A pass
+                # that legitimately remaps origins can be added to
+                # COMPILER_GENERATED_PASSES to suppress this.
+                lost = before - now
+                if lost and not exempt:
+                    self._warn(
+                        f"dropped {len(lost)} of {len(before)} provenance "
+                        f"origin(s) on an existing buffer"
+                    )
+            elif not now and not exempt:
                 self._warn(
                     "created a buffer without provenance; use "
                     "preserve_/merge_/decompose_provenance"
