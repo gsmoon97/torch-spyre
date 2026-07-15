@@ -523,6 +523,23 @@ def _make_intermediate_bufs(
         elif "val" in orig_node.meta:
             new_node.meta["val"] = orig_node.meta["val"].to(out_dtype)
 
+        # Preserve source provenance on the split child so its debug_handle
+        # resolves back to the op being split, and record the child's own op
+        # identity. build_debug_handle reads stack_trace / original_aten, not
+        # merely the presence of a node in origins (set below). Best-effort:
+        # copy the source only when the split op carries one.
+        #
+        # This compute-child branch is currently unreachable in practice: the
+        # backend forces one compute op per Pointwise buffer
+        # (patches.py sets Loops.has_large_inner_fn -> True), so a buffer whose
+        # inner_fn holds multiple compute ops does not arise, and this branch is
+        # only reached via the "constant" intermediates above. This assignment is
+        # kept as a guard so provenance stays correct if that realization policy
+        # ever changes and the branch becomes live.
+        if orig_node.meta.get("stack_trace"):
+            new_node.meta["stack_trace"] = orig_node.meta["stack_trace"]
+        new_node.meta["original_aten"] = target
+
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
         # Set origins using object.__setattr__ to work around dataclass frozen fields.
