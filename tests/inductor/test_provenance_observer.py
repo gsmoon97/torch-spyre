@@ -195,3 +195,28 @@ class TestPipelineWrapping:
         pipeline.passes = [dropping_gl_pass]
         pipeline(_FakeGraph([_Buf(origins={"a"})]))
         assert any("dropping_gl_pass" in str(w.message) for w in recwarn.list)
+
+    def test_warning_dedup_resets_per_pipeline_run(self):
+        import warnings
+        from torch_spyre._inductor.passes import _SpyreNodePassPipeline
+
+        def dedup_reset_pass(nodes):
+            for n in nodes:
+                n.node.origins = set()  # drop provenance every run
+            return nodes
+
+        pipeline = _SpyreNodePassPipeline([dedup_reset_pass])
+        pipeline._has_spyre_device = lambda target: True
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            pipeline([_unit(_Buf(origins={"a"}))])
+            after_first = sum(
+                1 for w in caught if "dedup_reset_pass" in str(w.message)
+            )
+            pipeline([_unit(_Buf(origins={"a"}))])
+            after_second = sum(
+                1 for w in caught if "dedup_reset_pass" in str(w.message)
+            )
+        assert after_first >= 1
+        assert after_second > after_first  # reset -> a new run warns again
