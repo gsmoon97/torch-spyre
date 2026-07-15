@@ -1,6 +1,6 @@
 # Example Audit: `SimpleMLP` — Source-to-Kernel Provenance
 
-> Generated: 2026-07-14 18:01 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
+> Generated: 2026-07-15 14:22 &nbsp;|&nbsp; Issue: [torch-spyre#2574](https://github.com/torch-spyre/torch-spyre/issues/2574)
 
 One worked example of the provenance audit (see the README for how to run it): `SimpleMLP` traced in-process through a single cache-defeated `torch.compile`. Measurement-only — every table and the lineage graph below are computed from the captured compile-path objects.
 
@@ -121,7 +121,7 @@ All observed `node.meta` keys: `['example_value', 'mutation_region_id', 'nn_modu
 | Node | target | `stack_trace` | `nn_module_stack` | `source_fn_stack` | `original_aten` | `from_node` | source line |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `x` | `<built-in function linear>` | `str` | `dict` | `list` | ✗ | ✗ | `x = self.fc1(x)` |
-| `x_1` | `<built-in method relu of type object at 0x7fbb732c98a0>` | `str` | ✗ | `list` | ✗ | ✗ | `x = torch.relu(x)` |
+| `x_1` | `<built-in method relu of type object at 0x7fc0e64078a0>` | `str` | ✗ | `list` | ✗ | ✗ | `x = torch.relu(x)` |
 | `x_2` | `<built-in function linear>` | `str` | `dict` | `list` | ✗ | ✗ | `x = self.fc2(x)` |
 
 ## Stage 2b — FX Graph (post-grad): 7 compute nodes
@@ -190,7 +190,7 @@ Tracked fields: `origins` (FX nodes that lowered into this buffer), `origin_node
 | `batchmatmul` | `op3` | `mm_default`, `permute_1` | `mm_default` | `4917498687135836649` | `reference_mlp.py:27` |
 | `add` | `op4` | `add_tensor` | `add_tensor` | `6208522288796453179` | — |
 
-## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (1 kernels)
+## Stage 6 — SuperDSC: 5 `sdsc_*.json` files (1 kernel)
 
 Each `OpSpec` is serialized to a `sdsc_*.json` kernel spec; the `debug_handle` travels with it (JSON key `debug_handle_`), resolving each kernel back to source.
 

@@ -108,6 +108,16 @@ CREATED_AT: dict[str, int] = {
 }
 
 
+def _plural(n: int, word: str) -> str:
+    """Naive pluralizer for count headers: ``1 kernel`` / ``2 kernels``.
+
+    The report runs on arbitrary models, so every "N <thing>" header must read
+    correctly at ``n == 1`` (e.g. a single-kernel model), not just for the
+    SimpleMLP snapshot. Regular ``+s`` is sufficient for the nouns used here.
+    """
+    return word if n == 1 else f"{word}s"
+
+
 # --------------------------------------------------------------------------
 # Presence computation (purely from captured data)
 # --------------------------------------------------------------------------
@@ -414,6 +424,11 @@ def _lineage_section(
         kind = _short_target(n.get("target", ""))
         nid = add("pg", "pg", n["name"], f"{n['name']} · {kind}" if kind else n["name"])
         link(_mermaid_id("src", s), nid)
+        # TODO(#<issue>): one pre-grad node per source line only. When several
+        # pre-grad nodes share a source line, the post-grad decomposition edges
+        # below attach to just this first anchor and the rest are dropped (fine
+        # for SimpleMLP's 1-node-per-line graph, wrong for larger models). Fix =
+        # store a list of ids per source line and link post-grad nodes to all.
         pg_by_source.setdefault(s, nid)
 
     # FX post-grad, linked up to its source(s)' pre-grad node (decomposition).
@@ -643,7 +658,8 @@ def render(
     ]:
         meta_keys = sorted({k for n in nodes for k in n.get("all_meta_keys", [])})
         L += [
-            f"## Stage {slabel} — FX Graph ({plabel}): {len(nodes)} compute nodes",
+            f"## Stage {slabel} — FX Graph ({plabel}): {len(nodes)} "
+            f"compute {_plural(len(nodes), 'node')}",
             "",
             transition,
             "",
@@ -683,7 +699,7 @@ def render(
     ]:
         ir_attrs = sorted({a for o in ops_list for a in o.get("all_attrs", [])})
         L += [
-            f"## {stage_label}: {len(ops_list)} operations",
+            f"## {stage_label}: {len(ops_list)} {_plural(len(ops_list), 'operation')}",
             "",
             transition,
             "",
@@ -714,7 +730,7 @@ def render(
     # Stage 5 detail ------------------------------------------------------
     total_ops = len(opspec_ops)
     L += [
-        f"## Stage 5 — OpSpec: {total_ops} ops",
+        f"## Stage 5 — OpSpec: {total_ops} {_plural(total_ops, 'op')}",
         "",
         "Each scheduled `ComputedBuffer` becomes an `OpSpec` (the device op); "
         "`debug_handle` carries source provenance onto it, while the `origins` / "
@@ -759,9 +775,26 @@ def render(
             for k in f["debug_handle"]
         }
     )
+    # The debug_handle counts only tally successfully-parsed files, so the
+    # coverage denominator must match: an unparsed sdsc_*.json is "unknown", not
+    # "missing a handle". Parse errors never occur for valid compiler output;
+    # this just keeps the ratio honest (and flags the drop) if one ever does.
+    parsed_files = sum(
+        1
+        for b in bundles.get("kernels", [])
+        for f in b.get("sdsc_files", [])
+        if "parse_error" not in f
+    )
+    unparsed = total_files - parsed_files
+    coverage_note = (
+        f"`debug_handle_` present in `{dh_present}/{parsed_files}` files, "
+        f"non-null in `{dh_nonnull}/{parsed_files}`"
+        + (f" ({unparsed} unparsed, excluded)." if unparsed else ".")
+    )
     L += [
         f"## Stage 6 — SuperDSC: {total_files} "
-        f"`sdsc_*.json` files ({len(kernels)} kernels)",
+        f"`sdsc_*.json` {_plural(total_files, 'file')} "
+        f"({len(kernels)} {_plural(len(kernels), 'kernel')})",
         "",
         "Each `OpSpec` is serialized to a `sdsc_*.json` kernel spec; the "
         "`debug_handle` travels with it (JSON key `debug_handle_`), resolving "
@@ -770,8 +803,7 @@ def render(
         "Tracked (per `debug_handle_`): `id` (stable content hash), `source` "
         "(`file:line`), `aten_op`, `fused_from` (constituent handles when fused).",
         "",
-        f"`debug_handle_` present in `{dh_present}/{total_files}` files, non-null "
-        f"in `{dh_nonnull}/{total_files}`.",
+        coverage_note,
         "",
         f"All observed `debug_handle` keys: `{dh_keys}`.",
         "",
