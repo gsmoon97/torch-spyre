@@ -307,6 +307,22 @@ def _origins_of(unit: Any) -> frozenset:
     return frozenset(getattr(unit, "origins", None) or ())
 
 
+def _unit_key(unit: Any) -> Any:
+    """Stable snapshot key for a provenance-bearing buffer.
+
+    Prefer the buffer name: it is stable when a pass reconstructs a buffer as a
+    fresh object, so a same-name replacement is matched to its predecessor and
+    origin loss across the reconstruction is detected. Fall back to identity.
+    """
+    get_name = getattr(unit, "get_name", None)
+    if callable(get_name):
+        try:
+            return get_name()
+        except Exception:
+            return id(unit)
+    return id(unit)
+
+
 class SpyreGraphTransformObserver:
     """Detects provenance (``origins``) dropped by a Spyre pass.
 
@@ -325,7 +341,7 @@ class SpyreGraphTransformObserver:
         self.target = target
         self.pass_name = pass_name
         self.kind = kind
-        self._before: dict[int, frozenset] = {}
+        self._before: dict[Any, frozenset] = {}
         self._active = _provenance_enabled() and kind != "graph"
 
     def __enter__(self) -> "SpyreGraphTransformObserver":
@@ -333,7 +349,7 @@ class SpyreGraphTransformObserver:
             return self
         try:
             for u in _iter_prov_units(self.target, self.kind):
-                self._before[id(u)] = _origins_of(u)
+                self._before[_unit_key(u)] = _origins_of(u)
         except Exception:
             self._active = False
         return self
@@ -350,7 +366,7 @@ class SpyreGraphTransformObserver:
     def _reconcile(self) -> None:
         exempt = self.pass_name in COMPILER_GENERATED_PASSES
         for u in _iter_prov_units(self.target, self.kind):
-            before = self._before.get(id(u))
+            before = self._before.get(_unit_key(u))
             now = _origins_of(u)
             if before is not None:
                 # Warn on ANY lost origin, not only a complete drop: a fused

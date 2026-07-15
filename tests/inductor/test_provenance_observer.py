@@ -180,6 +180,15 @@ class TestObserverDetection:
         with SpyreGraphTransformObserver(object(), "weird_target", kind="node"):
             pass
 
+    def test_replacement_buffer_partial_loss_warns(self, prov_logs):
+        # A pass that swaps a buffer for a fresh SAME-NAME object holding a
+        # subset of origins ({a,b} -> {a}) must still be flagged; identity-keyed
+        # snapshots would miss it because the object id changed.
+        target = _NodeListTarget([_unit(_Buf(origins={"a", "b"}, name="x"))])
+        with SpyreGraphTransformObserver(target, "replace_pass", kind="node"):
+            target[0] = _unit(_Buf(origins={"a"}, name="x"))  # same name, lost "b"
+        assert any("replace_pass" in r.getMessage() for r in prov_logs)
+
 
 class TestPipelineWrapping:
     def test_node_pipeline_observes_each_pass(self, prov_logs):
