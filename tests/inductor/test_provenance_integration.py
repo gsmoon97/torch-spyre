@@ -51,8 +51,29 @@ class _MLP(torch.nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def test_handles_survive_real_compile(monkeypatch):
-    import torch_spyre  # noqa: F401
+class _RichMLP(torch.nn.Module):
+    # Same stick-aligned dims as _MLP, but adds layernorm + gelu between the two
+    # matmuls so provenance survival is asserted across more production passes
+    # (norm and activation lowering, not just a pointwise relu).
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(128, 256)
+        self.ln = torch.nn.LayerNorm(256)
+        self.fc2 = torch.nn.Linear(256, 128)
+
+    def forward(self, x):
+        return self.fc2(torch.nn.functional.gelu(self.ln(self.fc1(x))))
+
+
+def _assert_handles_survive_real_compile(monkeypatch, model):
+    """Compile ``model`` on-device and assert the three provenance invariants.
+
+    Shared by every model parametrization of
+    ``test_handles_survive_real_compile``: (a) no pass dropped provenance, (b)
+    at least one handle resolves to a source line in this test module, and (c)
+    at least one fused handle's ``fused_from`` carries that source line among
+    its constituents.
+    """
     from torch_spyre.constants import DEVICE_NAME
     import torch_spyre._inductor.provenance as prov
     import torch_spyre._inductor.spyre_kernel as sk
@@ -77,7 +98,7 @@ def test_handles_survive_real_compile(monkeypatch):
     monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
     torch._dynamo.reset()
 
-    model = _MLP().half().to(DEVICE_NAME).eval()
+    model = model.half().to(DEVICE_NAME).eval()
     x = torch.randn(2, 128, dtype=torch.float16, device=DEVICE_NAME)
 
     with warnings.catch_warnings(record=True) as caught:
@@ -116,3 +137,14 @@ def test_handles_survive_real_compile(monkeypatch):
         for h in fused
         for c in h.fused_from
     ), "fused_from did not carry the constituent source line"
+
+
+@pytest.mark.parametrize(
+    "model_cls",
+    [_MLP, _RichMLP],
+    ids=["mlp_relu", "mlp_gelu_ln"],
+)
+def test_handles_survive_real_compile(monkeypatch, model_cls):
+    import torch_spyre  # noqa: F401
+
+    _assert_handles_survive_real_compile(monkeypatch, model_cls())
