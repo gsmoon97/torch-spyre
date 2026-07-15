@@ -14,6 +14,10 @@
 
 """Device-free unit tests for the provenance forwarding helpers and observer."""
 
+import logging
+import logging.handlers
+
+import pytest
 import regex  # noqa: F401  (repo convention: never import re)
 
 from torch_spyre._inductor.provenance import (
@@ -23,6 +27,21 @@ from torch_spyre._inductor.provenance import (
     decompose_provenance,
     SpyreGraphTransformObserver,
 )
+
+
+@pytest.fixture
+def prov_logs():
+    # Capture WARNING records emitted by the provenance observer.
+    logger = logging.getLogger("spyre.inductor.provenance")
+    handler = logging.handlers.MemoryHandler(capacity=10000)
+    prev_level = logger.level
+    logger.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        yield handler.buffer
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
 
 
 class _Buf:
@@ -108,53 +127,53 @@ def _unit(buf):
 
 
 class TestObserverDetection:
-    def test_regression_warns(self, recwarn):
+    def test_regression_warns(self, prov_logs):
         b = _Buf(origins={"a"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "bad_pass_regress", kind="node"):
             b.origins = set()  # pass wrongly drops provenance
-        assert any("bad_pass_regress" in str(w.message) for w in recwarn.list)
+        assert any("bad_pass_regress" in r.getMessage() for r in prov_logs)
 
-    def test_preserved_no_warning(self, recwarn):
+    def test_preserved_no_warning(self, prov_logs):
         b = _Buf(origins={"a"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "good_pass_keep", kind="node"):
             pass  # no change
-        assert not [w for w in recwarn.list if "good_pass_keep" in str(w.message)]
+        assert not any("good_pass_keep" in r.getMessage() for r in prov_logs)
 
-    def test_new_unattributed_buffer_warns(self, recwarn):
+    def test_new_unattributed_buffer_warns(self, prov_logs):
         target = _NodeListTarget([])
         with SpyreGraphTransformObserver(target, "creates_bare_buf", kind="node"):
             target.append(_unit(_Buf(origins=set())))
-        assert any("creates_bare_buf" in str(w.message) for w in recwarn.list)
+        assert any("creates_bare_buf" in r.getMessage() for r in prov_logs)
 
-    def test_allowlisted_new_buffer_silent(self, recwarn):
+    def test_allowlisted_new_buffer_silent(self, prov_logs):
         target = _NodeListTarget([])
         with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
             target.append(_unit(_Buf(origins=set())))  # source-less by design
-        assert not recwarn.list
+        assert not any("spyre-provenance" in r.getMessage() for r in prov_logs)
 
-    def test_partial_origin_loss_warns(self, recwarn):
+    def test_partial_origin_loss_warns(self, prov_logs):
         b = _Buf(origins={"a", "b"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "partial_drop_pass", kind="node"):
             b.origins = {"a"}  # loses "b" but is not empty
-        assert any("partial_drop_pass" in str(w.message) for w in recwarn.list)
+        assert any("partial_drop_pass" in r.getMessage() for r in prov_logs)
 
-    def test_allowlisted_partial_loss_silent(self, recwarn):
+    def test_allowlisted_partial_loss_silent(self, prov_logs):
         b = _Buf(origins={"a", "b"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
             b.origins = {"a"}  # an allowlisted pass may legitimately remap
-        assert not recwarn.list
+        assert not any("spyre-provenance" in r.getMessage() for r in prov_logs)
 
-    def test_disabled_by_env(self, recwarn, monkeypatch):
+    def test_disabled_by_env(self, prov_logs, monkeypatch):
         monkeypatch.setenv("TORCH_SPYRE_PROVENANCE", "0")
         b = _Buf(origins={"a"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "bad_pass_env", kind="node"):
             b.origins = set()
-        assert not recwarn.list
+        assert not any("spyre-provenance" in r.getMessage() for r in prov_logs)
 
     def test_never_raises_on_bad_target(self):
         # Enumeration failure must not propagate.
@@ -163,7 +182,7 @@ class TestObserverDetection:
 
 
 class TestPipelineWrapping:
-    def test_node_pipeline_observes_each_pass(self, recwarn):
+    def test_node_pipeline_observes_each_pass(self, prov_logs):
         from torch_spyre._inductor.passes import _SpyreNodePassPipeline
 
         def dropping_node_pass(nodes):
@@ -175,9 +194,9 @@ class TestPipelineWrapping:
         # Force the device guard on so the loop body runs off-device.
         pipeline._has_spyre_device = lambda target: True
         pipeline([_unit(_Buf(origins={"a"}))])
-        assert any("dropping_node_pass" in str(w.message) for w in recwarn.list)
+        assert any("dropping_node_pass" in r.getMessage() for r in prov_logs)
 
-    def test_graphlowering_pipeline_observes_each_pass(self, recwarn, monkeypatch):
+    def test_graphlowering_pipeline_observes_each_pass(self, prov_logs, monkeypatch):
         import torch_spyre._inductor.passes as passes_mod
 
         class _FakeGraph:
@@ -194,10 +213,9 @@ class TestPipelineWrapping:
         pipeline = passes_mod.CustomPreSchedulingPasses()
         pipeline.passes = [dropping_gl_pass]
         pipeline(_FakeGraph([_Buf(origins={"a"})]))
-        assert any("dropping_gl_pass" in str(w.message) for w in recwarn.list)
+        assert any("dropping_gl_pass" in r.getMessage() for r in prov_logs)
 
-    def test_warning_dedup_resets_per_pipeline_run(self):
-        import warnings
+    def test_warning_dedup_resets_per_pipeline_run(self, prov_logs):
         from torch_spyre._inductor.passes import _SpyreNodePassPipeline
 
         def dedup_reset_pass(nodes):
@@ -208,15 +226,14 @@ class TestPipelineWrapping:
         pipeline = _SpyreNodePassPipeline([dedup_reset_pass])
         pipeline._has_spyre_device = lambda target: True
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            pipeline([_unit(_Buf(origins={"a"}))])
-            after_first = sum(
-                1 for w in caught if "dedup_reset_pass" in str(w.message)
-            )
-            pipeline([_unit(_Buf(origins={"a"}))])
-            after_second = sum(
-                1 for w in caught if "dedup_reset_pass" in str(w.message)
-            )
+        # The buffer grows per emission and is never cleared between runs:
+        # this is what proves the observer now genuinely re-emits per compile
+        # (the cumulative count strictly increases on the second run) rather
+        # than being silenced by Python's per-process warning registry, which
+        # this test would have caught under the old warnings.warn emission.
+        pipeline([_unit(_Buf(origins={"a"}))])
+        after_first = sum(1 for r in prov_logs if "dedup_reset_pass" in r.getMessage())
+        pipeline([_unit(_Buf(origins={"a"}))])
+        after_second = sum(1 for r in prov_logs if "dedup_reset_pass" in r.getMessage())
         assert after_first >= 1
         assert after_second > after_first  # reset -> a new run warns again

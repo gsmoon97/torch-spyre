@@ -14,8 +14,9 @@
 
 """Device integration test: provenance survives a real Spyre compile end-to-end."""
 
+import logging
+import logging.handlers
 import os
-import warnings
 
 import pytest
 import regex  # noqa: F401  (repo convention: never import re)
@@ -101,15 +102,20 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
     model = model.half().to(DEVICE_NAME).eval()
     x = torch.randn(2, 128, dtype=torch.float16, device=DEVICE_NAME)
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    prov_logger = logging.getLogger("spyre.inductor.provenance")
+    handler = logging.handlers.MemoryHandler(capacity=10000)
+    prov_logger.setLevel(logging.WARNING)
+    prov_logger.addHandler(handler)
+    try:
         with torch.no_grad():
             torch.compile(model)(x)
+    finally:
+        prov_logger.removeHandler(handler)
 
     # (a) No pass dropped provenance (observer emitted no drop warnings).
-    drops = [w for w in caught if "spyre-provenance" in str(w.message)]
+    drops = [r for r in handler.buffer if "spyre-provenance" in r.getMessage()]
     assert not drops, (
-        f"observer reported provenance drops: {[str(w.message) for w in drops]}"
+        f"observer reported provenance drops: {[r.getMessage() for r in drops]}"
     )
 
     # (b) At least one handle resolved to a real source line (the matmul traces
