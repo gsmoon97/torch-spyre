@@ -189,6 +189,24 @@ class TestObserverDetection:
             target[0] = _unit(_Buf(origins={"a"}, name="x"))  # same name, lost "b"
         assert any("replace_pass" in r.getMessage() for r in prov_logs)
 
+    def test_origin_node_loss_warns(self, prov_logs):
+        # A pass that keeps origins but clears origin_node still loses the
+        # authoritative source/aten pointer; a non-allowlisted pass must warn.
+        b = _Buf(origins={"a"}, origin_node="a")
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "drops_origin_node", kind="node"):
+            b.origin_node = None  # origins intact, authoritative pointer gone
+        assert any("drops_origin_node" in r.getMessage() for r in prov_logs)
+
+    def test_origin_node_loss_exempt_pass_silent(self, prov_logs):
+        # An allowlisted (compiler-generated) pass may legitimately rebuild the
+        # buffer and drop origin_node; it must NOT warn.
+        b = _Buf(origins={"a"}, origin_node="a")
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
+            b.origin_node = None
+        assert not any("origin_node" in r.getMessage() for r in prov_logs)
+
 
 class TestPipelineWrapping:
     def test_node_pipeline_observes_each_pass(self, prov_logs):

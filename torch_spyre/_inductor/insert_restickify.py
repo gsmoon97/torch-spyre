@@ -196,6 +196,8 @@ def insert_restickify_on_node_inputs(
     )
     new_consumer_buffer.operation_name = op.operation_name
     new_consumer_buffer.origins = op.origins
+    # origin_node is authoritative for handle source; carry it across the rebuild.
+    new_consumer_buffer.origin_node = op.origin_node
     copy_op_metadata(op, new_consumer_buffer)
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer
