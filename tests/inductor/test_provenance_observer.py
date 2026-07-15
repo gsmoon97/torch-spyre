@@ -134,6 +134,20 @@ class TestObserverDetection:
             target.append(_unit(_Buf(origins=set())))  # source-less by design
         assert not recwarn.list
 
+    def test_partial_origin_loss_warns(self, recwarn):
+        b = _Buf(origins={"a", "b"})
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "partial_drop_pass", kind="node"):
+            b.origins = {"a"}  # loses "b" but is not empty
+        assert any("partial_drop_pass" in str(w.message) for w in recwarn.list)
+
+    def test_allowlisted_partial_loss_silent(self, recwarn):
+        b = _Buf(origins={"a", "b"})
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
+            b.origins = {"a"}  # an allowlisted pass may legitimately remap
+        assert not recwarn.list
+
     def test_disabled_by_env(self, recwarn, monkeypatch):
         monkeypatch.setenv("TORCH_SPYRE_PROVENANCE", "0")
         b = _Buf(origins={"a"})
