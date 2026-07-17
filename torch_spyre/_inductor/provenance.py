@@ -247,13 +247,11 @@ def decompose_provenance(old: Any, news: Sequence[Any], context: str) -> None:
         setattr(child, _SPYRE_PROV_CONTEXT_ATTR, context)
 
 
-# Passes exempted from provenance warnings: their newly-created buffers are
-# legitimately source-less (compiler-generated, analogous to LLVM
-# getCompilerGenerated) -> honest-empty, not warned, OR they legitimately
-# remap an existing buffer's origins and so may lose some without warning.
-# Keep conservative; add a pass here only after confirming its new buffers have
-# no user-source origin by design, or its origin remapping is intentional.
-COMPILER_GENERATED_PASSES = frozenset(
+# Passes whose newly-created buffers are legitimately source-less
+# (compiler-generated, analogous to LLVM getCompilerGenerated). This exemption
+# applies only to creation; it must not hide provenance loss on existing buffers
+# reconstructed by the same pass.
+SOURCELESS_CREATION_PASSES = frozenset(
     {
         "insert_restickify",
         "insert_post_mutation_restickify",
@@ -261,6 +259,11 @@ COMPILER_GENERATED_PASSES = frozenset(
         "dedup_and_promote_constants",
     }
 )
+
+# Passes that intentionally remap provenance on existing buffers. Keep this
+# separate and conservative: add an entry only after verifying that dropping an
+# old origin or origin_node is part of the pass's declared rewrite semantics.
+INTENTIONAL_PROVENANCE_REMAP_PASSES: frozenset[str] = frozenset()
 
 # Warn at most once per pass name per compile to avoid log spam. Reset by the
 # Spyre pass pipelines at the start of each run via reset_provenance_warnings().
@@ -329,9 +332,9 @@ class SpyreGraphTransformObserver:
     Context manager wrapping one pass. On exit it compares each buffer's
     ``origins`` against a pre-pass snapshot and warns once per pass when an
     existing buffer's origins were cleared or partially dropped, or a new
-    buffer was created without origins, and its pass is not in
-    ``COMPILER_GENERATED_PASSES``. Best-effort: never raises into the compile
-    path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
+    buffer was created without origins. Declared source-less creations and
+    intentional remaps use separate exemptions. Best-effort: never raises into
+    the compile path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
 
     It does NOT forward provenance or set fusion context — that is the job of the
     preserve/merge/decompose helpers and the existing buffer-reconstruction path.
@@ -367,7 +370,8 @@ class SpyreGraphTransformObserver:
             pass  # provenance is best-effort
 
     def _reconcile(self) -> None:
-        exempt = self.pass_name in COMPILER_GENERATED_PASSES
+        creation_exempt = self.pass_name in SOURCELESS_CREATION_PASSES
+        remap_exempt = self.pass_name in INTENTIONAL_PROVENANCE_REMAP_PASSES
         for u in _iter_prov_units(self.target, self.kind):
             snap = self._before.get(_unit_key(u))
             now = _origins_of(u)
@@ -375,10 +379,10 @@ class SpyreGraphTransformObserver:
                 before, before_node = snap
                 # Warn on ANY lost origin, not only a complete drop: a fused
                 # buffer going {a, b} -> {a} silently loses one source. A pass
-                # that legitimately remaps origins can be added to
-                # COMPILER_GENERATED_PASSES to suppress this.
+                # that legitimately remaps origins can declare that separately
+                # without suppressing source-less creation checks.
                 lost = before - now
-                if lost and not exempt:
+                if lost and not remap_exempt:
                     self._warn(
                         f"dropped {len(lost)} of {len(before)} provenance "
                         f"origin(s) on an existing buffer"
@@ -386,12 +390,12 @@ class SpyreGraphTransformObserver:
                 # origin_node is authoritative for handle source/aten; a pass
                 # that had one and cleared it silently loses attribution.
                 now_node = getattr(u, "origin_node", None)
-                if before_node is not None and now_node is None and not exempt:
+                if before_node is not None and now_node is None and not remap_exempt:
                     self._warn(
                         "dropped origin_node (authoritative provenance) on an "
                         "existing buffer"
                     )
-            elif not now and not exempt:
+            elif not now and not creation_exempt:
                 self._warn(
                     "created a buffer without provenance; use "
                     "preserve_/merge_/decompose_provenance"

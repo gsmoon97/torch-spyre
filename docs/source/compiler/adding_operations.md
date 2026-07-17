@@ -135,9 +135,11 @@ you add a pass and see a `[spyre-provenance] pass '<name>' ...` warning, forward
 provenance with one of the helpers above.
 
 Some passes legitimately create source-less buffers (for example padding via
-`constant_pad_nd`) or rebuild and remap a buffer's provenance as part of their
-job. Those pass names are listed in `COMPILER_GENERATED_PASSES` in `provenance.py`
-and are exempt from all of these warnings (partial or complete `origins` loss,
-`origin_node` loss, and source-less creation); add a pass there only after
-confirming its provenance changes are intentional. Set `TORCH_SPYRE_PROVENANCE=0`
-to disable the observer entirely.
+`constant_pad_nd`). Those pass names are listed in
+`SOURCELESS_CREATION_PASSES` in `provenance.py` and are exempt only when they
+create a new buffer without provenance; the observer still reports provenance
+loss on existing buffers reconstructed by the same pass. A pass that
+intentionally remaps an existing buffer must separately declare that policy in
+`INTENTIONAL_PROVENANCE_REMAP_PASSES`, after confirming the lost origins or
+`origin_node` are intentional. Set `TORCH_SPYRE_PROVENANCE=0` to disable the
+observer entirely.
