@@ -26,12 +26,14 @@ from torch_spyre._inductor.provenance import (
     merge_provenance,
     decompose_provenance,
     SpyreGraphTransformObserver,
+    reset_provenance_warnings,
 )
 
 
 @pytest.fixture
 def prov_logs():
     # Capture WARNING records emitted by the provenance observer.
+    reset_provenance_warnings()
     logger = logging.getLogger("spyre.inductor.provenance")
     handler = logging.handlers.MemoryHandler(capacity=10000)
     prev_level = logger.level
@@ -160,12 +162,12 @@ class TestObserverDetection:
             b.origins = {"a"}  # loses "b" but is not empty
         assert any("partial_drop_pass" in r.getMessage() for r in prov_logs)
 
-    def test_allowlisted_partial_loss_silent(self, prov_logs):
+    def test_sourceless_creation_pass_partial_loss_warns(self, prov_logs):
         b = _Buf(origins={"a", "b"})
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
-            b.origins = {"a"}  # an allowlisted pass may legitimately remap
-        assert not any("spyre-provenance" in r.getMessage() for r in prov_logs)
+            b.origins = {"a"}
+        assert any("insert_restickify" in r.getMessage() for r in prov_logs)
 
     def test_disabled_by_env(self, prov_logs, monkeypatch):
         monkeypatch.setenv("TORCH_SPYRE_PROVENANCE", "0")
@@ -198,14 +200,14 @@ class TestObserverDetection:
             b.origin_node = None  # origins intact, authoritative pointer gone
         assert any("drops_origin_node" in r.getMessage() for r in prov_logs)
 
-    def test_origin_node_loss_exempt_pass_silent(self, prov_logs):
-        # An allowlisted (compiler-generated) pass may legitimately rebuild the
-        # buffer and drop origin_node; it must NOT warn.
+    def test_sourceless_creation_pass_origin_node_loss_warns(self, prov_logs):
+        # Source-less helper creation does not excuse provenance loss on an
+        # existing buffer reconstructed by the same pass.
         b = _Buf(origins={"a"}, origin_node="a")
         target = _NodeListTarget([_unit(b)])
         with SpyreGraphTransformObserver(target, "insert_restickify", kind="node"):
             b.origin_node = None
-        assert not any("origin_node" in r.getMessage() for r in prov_logs)
+        assert any("insert_restickify" in r.getMessage() for r in prov_logs)
 
 
 class TestPipelineWrapping:
