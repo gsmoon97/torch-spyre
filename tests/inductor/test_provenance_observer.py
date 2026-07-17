@@ -96,6 +96,13 @@ class TestMergeProvenance:
         assert new.origins == {"a", "b", "c"}
         assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "spyre_fuse_nodes"
 
+    def test_clears_single_source_origin_node(self):
+        s1 = _Buf(origins={"a"}, origin_node="a")
+        s2 = _Buf(origins={"b"}, origin_node="b")
+        new = _Buf(origin_node="a")
+        merge_provenance([s1, s2], new, context="spyre_fuse_nodes")
+        assert new.origin_node is None
+
 
 class TestDecomposeProvenance:
     def test_each_child_inherits_parent(self):
