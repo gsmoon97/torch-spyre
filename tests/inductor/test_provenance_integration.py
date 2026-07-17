@@ -104,6 +104,7 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
 
     prov_logger = logging.getLogger("spyre.inductor.provenance")
     handler = logging.handlers.MemoryHandler(capacity=10000)
+    previous_level = prov_logger.level
     prov_logger.setLevel(logging.WARNING)
     prov_logger.addHandler(handler)
     try:
@@ -111,6 +112,7 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
             torch.compile(model)(x)
     finally:
         prov_logger.removeHandler(handler)
+        prov_logger.setLevel(previous_level)
 
     # (a) No pass dropped provenance (observer emitted no drop warnings).
     drops = [r for r in handler.buffer if "spyre-provenance" in r.getMessage()]
@@ -153,4 +155,11 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
 def test_handles_survive_real_compile(monkeypatch, model_cls):
     import torch_spyre  # noqa: F401
 
-    _assert_handles_survive_real_compile(monkeypatch, model_cls())
+    prov_logger = logging.getLogger("spyre.inductor.provenance")
+    previous_level = prov_logger.level
+    prov_logger.setLevel(logging.ERROR)
+    try:
+        _assert_handles_survive_real_compile(monkeypatch, model_cls())
+        assert prov_logger.level == logging.ERROR
+    finally:
+        prov_logger.setLevel(previous_level)
