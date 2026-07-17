@@ -258,7 +258,7 @@ class TestBuildDebugHandle:
         assert h1.id == h2.id
 
     def test_reads_fusion_context_annotation(self):
-        # The SpyreGraphTransformObserver / provenance helpers stamp this
+        # Explicit provenance helpers stamp this
         # private attr on a ComputedBuffer during pass rewrites;
         # build_debug_handle must fold it into DebugHandle.fusion_context.
         from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR

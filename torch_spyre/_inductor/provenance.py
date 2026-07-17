@@ -40,7 +40,7 @@ _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
 # compile that hits the same regression.
 logger = get_inductor_logger("provenance")
 
-# Buffer attribute the SpyreGraphTransformObserver / provenance helpers stamp
+# Buffer attribute the explicit provenance helpers stamp
 # with the pass-level fusion or decomposition context (a FusedLoc-style metadata
 # tag). Carried across pass rewrites via loop_info._SPYRE_METADATA_ATTRS and
 # folded into DebugHandle.fusion_context by build_debug_handle.
