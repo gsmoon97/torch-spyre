@@ -228,9 +228,15 @@ def preserve_provenance(old: Any, new: Any) -> None:
 
 
 def merge_provenance(sources: Sequence[Any], new: Any, context: str) -> None:
-    """n->1 fusion: union all sources' origins onto new; record context."""
+    """n->1 fusion: union all origins, clear a stale primary, record context."""
     for s in sources:
         _union_origins(s, new)
+    # A fused buffer has no intrinsically authoritative constituent. Clear any
+    # primary inherited from the object used to initialize ``new``. The builder
+    # then derives source and ATen headlines independently from the full set: a
+    # field is populated only when there is one distinct non-None value;
+    # conflicting values stay None, and fused_from remains authoritative.
+    new.origin_node = None
     setattr(new, _SPYRE_PROV_CONTEXT_ATTR, context)
 
 
