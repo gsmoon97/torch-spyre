@@ -107,7 +107,7 @@ _SPYRE_METADATA_ATTRS = (
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
     # Pass-level fusion/decomposition context (set by the
-    # SpyreGraphTransformObserver / provenance helpers); read by
+    # explicit provenance helpers); read by
     # provenance.build_debug_handle into DebugHandle.fusion_context.
     _SPYRE_PROV_CONTEXT_ATTR,
 )

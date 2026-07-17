@@ -44,6 +44,7 @@ from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .provenance import preserve_provenance
 from .views import compute_coordinates, matching_dim
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -1169,8 +1170,7 @@ def replace_computed_buffer_body(
         _original_reduction_ranges=op._original_reduction_ranges,
     )
     new_buf.operation_name = op.operation_name
-    new_buf.origins = op.origins
-    new_buf.origin_node = op.origin_node
+    preserve_provenance(op, new_buf)
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 

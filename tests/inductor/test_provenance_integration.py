@@ -66,30 +66,40 @@ class _RichMLP(torch.nn.Module):
         return self.fc2(torch.nn.functional.gelu(self.ln(self.fc1(x))))
 
 
-def _assert_handles_survive_real_compile(monkeypatch, model):
-    """Compile ``model`` on-device and assert the three provenance invariants.
+def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
+    """Compile ``model`` on-device and assert the provenance invariants.
 
     Shared by every model parametrization of
     ``test_handles_survive_real_compile``: (a) no pass dropped provenance, (b)
-    at least one handle resolves to a source line in this test module, and (c)
-    at least one fused handle's ``fused_from`` carries that source line among
-    its constituents.
+    a production reconstruction uses ``preserve_provenance`` when the model
+    exercises one, (c) at least one handle resolves to a source line in this test
+    module, and (d) a fused handle carries that line among its constituents.
     """
     from torch_spyre.constants import DEVICE_NAME
+    import torch_spyre._inductor.insert_restickify as restickify
+    import torch_spyre._inductor.pass_utils as pass_utils
     import torch_spyre._inductor.provenance as prov
     import torch_spyre._inductor.spyre_kernel as sk
 
     collected = []
+    preserved = []
     _orig = prov.build_debug_handle
+    _orig_preserve = prov.preserve_provenance
 
     def _collect(buffer):
         h = _orig(buffer)
         collected.append(h)
         return h
 
-    # spyre_kernel imported build_debug_handle by name, so patch it there too.
+    def _preserve(old, new):
+        _orig_preserve(old, new)
+        preserved.append((old, new))
+
+    # These modules import the helpers by name, so patch each bound reference.
     monkeypatch.setattr(prov, "build_debug_handle", _collect)
     monkeypatch.setattr(sk, "build_debug_handle", _collect)
+    monkeypatch.setattr(pass_utils, "preserve_provenance", _preserve)
+    monkeypatch.setattr(restickify, "preserve_provenance", _preserve)
 
     # Defeat Inductor's on-disk FX graph cache so codegen (and therefore
     # build_debug_handle) actually runs this process. Same pattern as the
@@ -120,7 +130,11 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
         f"observer reported provenance drops: {[r.getMessage() for r in drops]}"
     )
 
-    # (b) At least one handle resolved to a real source line (the matmul traces
+    # (b) Models that trigger a real buffer reconstruction use the helper.
+    if expect_rewrite:
+        assert preserved, "no production rewrite called preserve_provenance"
+
+    # (c) At least one handle resolved to a real source line (the matmul traces
     #     back to the model via the linear's weight-transpose origin).
     resolved = [
         h
@@ -134,7 +148,7 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
     this_file = os.path.basename(__file__)
     assert any(h.source.file.endswith(this_file) for h in resolved)
 
-    # (c) A fused op's handle references all its constituent sources via
+    # (d) A fused op's handle references all its constituent sources via
     #     fused_from. Each linear lowers to permute + mm fused into one buffer,
     #     so its handle carries a multi-entry fused_from, at least one entry of
     #     which resolves back to the model source line.
@@ -148,18 +162,18 @@ def _assert_handles_survive_real_compile(monkeypatch, model):
 
 
 @pytest.mark.parametrize(
-    "model_cls",
-    [_MLP, _RichMLP],
+    "model_cls,expect_rewrite",
+    [(_MLP, False), (_RichMLP, True)],
     ids=["mlp_relu", "mlp_gelu_ln"],
 )
-def test_handles_survive_real_compile(monkeypatch, model_cls):
+def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
     import torch_spyre  # noqa: F401
 
     prov_logger = logging.getLogger("spyre.inductor.provenance")
     previous_level = prov_logger.level
     prov_logger.setLevel(logging.ERROR)
     try:
-        _assert_handles_survive_real_compile(monkeypatch, model_cls())
+        _assert_handles_survive_real_compile(monkeypatch, model_cls(), expect_rewrite)
         assert prov_logger.level == logging.ERROR
     finally:
         prov_logger.setLevel(previous_level)
