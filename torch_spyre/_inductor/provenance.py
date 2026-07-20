@@ -305,11 +305,15 @@ def decompose_provenance(
     news: Sequence[Any],
     pass_name: str,
     reason: str | None = None,
+    *,
+    inherit_origins: bool = True,
 ) -> None:
     """1->n decomposition: each child inherits and extends old's provenance.
 
-    Each child unions old's origins into its own independent origins set and
-    receives its own immutable history tuple ending in the decomposition record.
+    By default each child inherits the parent's origins and primary node. Pass
+    inherit_origins=False when the transformation creates distinct semantic FX
+    origins for its children; their own origins remain authoritative while the
+    parent's transformation history still flows into each child.
     """
     node = getattr(old, "origin_node", None)
     transform = ProvenanceTransform(
@@ -318,9 +322,10 @@ def decompose_provenance(
         reason=reason,
     )
     for child in news:
-        _union_origins(old, child)
-        if node is not None and getattr(child, "origin_node", None) is None:
-            child.origin_node = node
+        if inherit_origins:
+            _union_origins(old, child)
+            if node is not None and getattr(child, "origin_node", None) is None:
+                child.origin_node = node
         _append_transform((old,), child, transform)
 
 
