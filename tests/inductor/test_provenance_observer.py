@@ -22,6 +22,7 @@ import pytest
 import regex  # noqa: F401  (repo convention: never import re)
 import torch
 import torch.fx as fx
+from torch._inductor import config as inductor_config
 
 from torch_spyre._inductor.loop_info import copy_op_metadata
 from torch_spyre._inductor.op_spec import ProvenanceTransform
@@ -39,18 +40,19 @@ from torch_spyre._inductor.split_multi_ops import _make_intermediate_bufs
 
 @pytest.fixture
 def prov_logs():
-    # Capture WARNING records emitted by the provenance observer.
-    reset_provenance_warnings()
-    logger = logging.getLogger("spyre.inductor.provenance")
-    handler = logging.handlers.MemoryHandler(capacity=10000)
-    prev_level = logger.level
-    logger.setLevel(logging.WARNING)
-    logger.addHandler(handler)
-    try:
-        yield handler.buffer
-    finally:
-        logger.removeHandler(handler)
-        logger.setLevel(prev_level)
+    # Observer tests opt in explicitly; production defaults to level 0 (off).
+    with inductor_config.patch("trace.provenance_tracking_level", 1):
+        reset_provenance_warnings()
+        logger = logging.getLogger("spyre.inductor.provenance")
+        handler = logging.handlers.MemoryHandler(capacity=10000)
+        prev_level = logger.level
+        logger.setLevel(logging.WARNING)
+        logger.addHandler(handler)
+        try:
+            yield handler.buffer
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev_level)
 
 
 class _Buf:
@@ -346,15 +348,25 @@ class TestObserverDetection:
             b.origins = {"a"}
         assert any("insert_restickify" in r.getMessage() for r in prov_logs)
 
-    def test_disabled_by_env(self, prov_logs, monkeypatch):
-        monkeypatch.setenv("TORCH_SPYRE_PROVENANCE", "0")
+    def test_level_zero_disables_observer(self, prov_logs):
         b = _Buf(origins={"a"})
         target = _NodeListTarget([_unit(b)])
-        with SpyreGraphTransformObserver(target, "bad_pass_env", kind="node"):
-            b.origins = set()
-        assert not any("spyre-provenance" in r.getMessage() for r in prov_logs)
+        with inductor_config.patch("trace.provenance_tracking_level", 0):
+            with SpyreGraphTransformObserver(target, "drop_at_level_0", kind="node"):
+                b.origins = set()
+        assert not any("drop_at_level_0" in r.getMessage() for r in prov_logs)
 
-    def test_never_raises_on_bad_target(self):
+    @pytest.mark.parametrize("level", [1, 2])
+    def test_positive_levels_enable_observer(self, prov_logs, level):
+        pass_name = f"drop_at_level_{level}"
+        b = _Buf(origins={"a"})
+        target = _NodeListTarget([_unit(b)])
+        with inductor_config.patch("trace.provenance_tracking_level", level):
+            with SpyreGraphTransformObserver(target, pass_name, kind="node"):
+                b.origins = set()
+        assert any(pass_name in r.getMessage() for r in prov_logs)
+
+    def test_never_raises_on_bad_target(self, prov_logs):
         # Enumeration failure must not propagate.
         with SpyreGraphTransformObserver(object(), "weird_target", kind="node"):
             pass

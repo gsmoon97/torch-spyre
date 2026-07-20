@@ -23,7 +23,6 @@ reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 from __future__ import annotations
 
 import hashlib
-import os
 from typing import Any, Sequence
 
 import regex
@@ -363,7 +362,18 @@ def reset_provenance_warnings() -> None:
 
 
 def _provenance_enabled() -> bool:
-    return os.environ.get("TORCH_SPYRE_PROVENANCE", "1") != "0"
+    """Return whether lower-IR provenance-drop detection is enabled."""
+    try:
+        # Import lazily so provenance construction remains independent of
+        # Inductor's optional debug configuration at module import time.
+        from torch._inductor import config as inductor_config
+
+        trace_config = getattr(inductor_config, "trace", None)
+        level = getattr(trace_config, "provenance_tracking_level", 0)
+        return level >= 1
+    except Exception:
+        # Detection is debug-only and must never break compilation.
+        return False
 
 
 def _iter_prov_units(target: Any, kind: str) -> list:
@@ -416,7 +426,9 @@ class SpyreGraphTransformObserver:
     snapshot. It warns once per pass when existing provenance was dropped or a
     new buffer was created without origins. Declared source-less creations and
     intentional remaps use separate exemptions. Best-effort: never raises into
-    the compile path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
+    the compile path. Active when Inductor's
+    ``trace.provenance_tracking_level >= 1``; handle construction and explicit
+    provenance forwarding remain unconditional.
 
     It does NOT forward provenance or record transformations — that is the job
     of the explicit helpers and existing buffer-reconstruction path.
