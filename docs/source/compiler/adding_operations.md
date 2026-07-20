@@ -157,5 +157,11 @@ create a new buffer without provenance; the observer still reports provenance
 loss on existing buffers reconstructed by the same pass. A pass that
 intentionally remaps an existing buffer must separately declare that policy in
 `INTENTIONAL_PROVENANCE_REMAP_PASSES`, after confirming the lost origins or
-`origin_node` are intentional. Set `TORCH_SPYRE_PROVENANCE=0` to disable the
-observer entirely.
+`origin_node` are intentional.
+
+The observer is disabled by default and follows Inductor's
+`trace.provenance_tracking_level`: every positive level, including level 2,
+enables it. Set `INDUCTOR_PROVENANCE=1`, or set `TORCH_COMPILE_DEBUG=1` when
+`INDUCTOR_PROVENANCE` is unset. Set `INDUCTOR_PROVENANCE=0` for an explicit
+force-off override. This gate affects only drop detection; debug-handle
+construction and the explicit forwarding helpers remain enabled.
