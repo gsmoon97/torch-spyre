@@ -31,7 +31,13 @@ from torch._inductor.utils import IndentedBuffer
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
-from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc, TensorArg
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    OpSpec,
+    ProvenanceTransform,
+    SourceLoc,
+    TensorArg,
+)
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 
@@ -118,6 +124,20 @@ class TestStableId:
         assert _stable_id(*a) != _stable_id(*b)
 
 
+class TestProvenanceTransform:
+    def test_is_structured_frozen_value(self):
+        transform = ProvenanceTransform("fusion", "fuse_ops", "same tile")
+        assert transform.to_dict() == {
+            "kind": "fusion",
+            "pass_name": "fuse_ops",
+            "reason": "same tile",
+        }
+        assert (
+            len({transform, ProvenanceTransform("fusion", "fuse_ops", "same tile")})
+            == 1
+        )
+
+
 class TestDebugHandle:
     def test_to_dict_is_structured_and_nested(self):
         child = DebugHandle(
@@ -132,6 +152,7 @@ class TestDebugHandle:
             aten_op="aten.mm.default",
             ir_chain=("mm_default_1", "op0"),
             fused_from=(child,),
+            transform_history=(ProvenanceTransform("fusion", "fuse_ops", "same tile"),),
         )
         d = h.to_dict()
         assert d["source"] == {
@@ -144,7 +165,14 @@ class TestDebugHandle:
         assert d["aten_op"] == "aten.mm.default"
         assert d["ir_chain"] == ["mm_default_1", "op0"]
         assert d["fused_from"][0]["aten_op"] == "aten.permute.default"
-        assert d["fusion_context"] is None
+        assert d["transform_history"] == [
+            {
+                "kind": "fusion",
+                "pass_name": "fuse_ops",
+                "reason": "same tile",
+            }
+        ]
+        assert d["fusion_context"] == "fuse_ops: same tile"
 
     def test_to_dict_serializes_id_as_string_for_js_safety(self):
         # A 63-bit id exceeds JS Number.MAX_SAFE_INTEGER (2**53-1); a JSON number
@@ -257,22 +285,38 @@ class TestBuildDebugHandle:
         assert h1.ir_chain == h2.ir_chain
         assert h1.id == h2.id
 
-    def test_reads_fusion_context_annotation(self):
-        # Explicit provenance helpers stamp this
-        # private attr on a ComputedBuffer during pass rewrites;
-        # build_debug_handle must fold it into DebugHandle.fusion_context.
-        from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR
+    def test_reads_structured_transform_history(self):
+        # Explicit provenance helpers stamp immutable records on a buffer;
+        # build_debug_handle carries the history and derives fusion_context.
+        from torch_spyre._inductor.provenance import _SPYRE_PROV_HISTORY_ATTR
 
         n = _node("mm", "/m.py", 5, "aten.mm.default")
         buf = _buffer([n])
-        setattr(buf, _SPYRE_PROV_CONTEXT_ATTR, "spyre_fuse_nodes")
+        history = (
+            ProvenanceTransform("decomposition", "split_multi_ops"),
+            ProvenanceTransform("fusion", "spyre_fuse_nodes", "same tile"),
+        )
+        setattr(buf, _SPYRE_PROV_HISTORY_ATTR, history)
         handle = build_debug_handle(buf)
         assert handle is not None
-        assert handle.fusion_context == "spyre_fuse_nodes"
+        assert handle.transform_history == history
+        assert handle.fusion_context == "spyre_fuse_nodes: same tile"
 
     def test_fusion_context_absent_is_none(self):
         n = _node("mm", "/m.py", 5, "aten.mm.default")
         assert build_debug_handle(_buffer([n])).fusion_context is None
+
+    def test_decomposition_does_not_create_fusion_context(self):
+        from torch_spyre._inductor.provenance import _SPYRE_PROV_HISTORY_ATTR
+
+        n = _node("split", "/m.py", 5, "aten.split.Tensor")
+        buf = _buffer([n])
+        setattr(
+            buf,
+            _SPYRE_PROV_HISTORY_ATTR,
+            (ProvenanceTransform("decomposition", "split"),),
+        )
+        assert build_debug_handle(buf).fusion_context is None
 
     def test_single_origin_no_trace_is_honest_empty(self):
         # A single compiler-generated origin with no stack_trace and no
