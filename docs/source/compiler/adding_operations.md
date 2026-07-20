@@ -99,40 +99,56 @@ Canonical implementations: `NameSwapHandler` in
 
 ## Preserving provenance in passes
 
-Each op's `debug_handle` is built at codegen from the buffer's `origins`, tying
-the emitted kernel back to its source (and, once profiler integration lands, a
-profiler event). The handle is only as good as the buffer's provenance: a buffer
-with no `origins` gets no handle at all, and one whose `origins` carry no stack
-trace gets a handle with no source line. A pass that creates or rewrites a
-`ComputedBuffer` must carry `origins` (and `origin_node`, which is authoritative
-for the handle's source) onto the new buffer, or that op loses its source
-attribution.
+Each op's `debug_handle` is built at codegen from the buffer's `origins`,
+`origin_node`, and structured transformation history. These values tie the
+emitted kernel back to its source and record how Spyre lower-IR passes derived
+it. A buffer with no `origins` gets no handle, while `origins` without a stack
+trace produce a handle with no source line. A pass that creates or rewrites a
+`ComputedBuffer` must preserve or deliberately remap this provenance.
 
 Reuse the existing helpers rather than setting `origins` by hand:
 
 + `replace_computed_buffer_body(op, new_data, operations)` in
   [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
-  when reconstructing a buffer's body: it forwards `operation_name`, `origins`,
-  and `origin_node`.
+  when reconstructing a buffer's body. It forwards `operation_name`, provenance,
+  and Spyre operation metadata.
 + `copy_op_metadata(src, dst)` in
   [loop_info.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/loop_info.py)
-  to carry Spyre metadata (including the fusion-context tag) across a
-  reconstructed buffer.
+  carries only Spyre operation metadata such as loop and layout annotations.
+  Provenance is intentionally owned by the provenance helpers, not this
+  metadata-copy channel.
 + `preserve_provenance`, `merge_provenance`, and `decompose_provenance` in
   [provenance.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/provenance.py)
   at explicit rewrite sites:
-  + `preserve_provenance(old, new)` for a 1-to-1 rewrite,
-  + `merge_provenance(sources, new, context)` when fusing several buffers into one
-    (unions their `origins` and records why),
-  + `decompose_provenance(old, news, context)` when splitting one buffer into many
-    (each output inherits the parent's `origins`).
+  + `preserve_provenance(old, new)` carries origins, the primary node, and
+    existing history through a 1-to-1 reconstruction.
+  + `merge_provenance(sources, new, pass_name, reason=None)` unions the source
+    origins, clears any stale primary node, and appends a `fusion` record.
+  + `decompose_provenance(old, news, pass_name, reason=None)` gives each output
+    the parent's origins and appends a `decomposition` record. Pass
+    `inherit_origins=False` only when every child already has its own deliberate
+    semantic FX origin, as `split_multi_ops` does.
+
+Transformation history is an immutable tuple of `ProvenanceTransform` records.
+Each record separates `kind`, `pass_name`, and optional `reason`; do not
+reintroduce a scalar context attribute. `DebugHandle.transform_history` is the
+authoritative serialized form. The legacy `fusion_context` JSON field is
+derived from the most recent fusion record for compatibility.
+
+When a lower-IR pass creates a fresh semantic FX node, retain the parent source
+lineage while assigning the child's own operation identity. In practice, copy
+`stack_trace`, add a `NodeSource` entry to `from_node`, set
+`original_aten` to the child target, and make that child the new buffer's
+origin. Do not union the parent FX node into the child's origins, because that
+would turn a decomposition into an apparent fusion.
 
 `SpyreGraphTransformObserver` wraps every pass in the node and pre-scheduling
 pipelines and emits a warning when a pass drops any of an existing buffer's
 `origins` (even a partial loss, such as a fused buffer going from two sources to
-one), clears its `origin_node`, or creates a buffer with no provenance at all. If
-you add a pass and see a `[spyre-provenance] pass '<name>' ...` warning, forward
-provenance with one of the helpers above.
+one), clears its `origin_node`, drops transformation-history records, or creates
+a buffer with no provenance. The observer detects loss but never guesses rewrite
+semantics or repairs provenance. If a warning appears, use an explicit helper at
+the rewrite site.
 
 Some passes legitimately create source-less buffers (for example padding via
 `constant_pad_nd`). Those pass names are listed in
