@@ -16,20 +16,25 @@
 
 import logging
 import logging.handlers
+from types import SimpleNamespace
 
 import pytest
 import regex  # noqa: F401  (repo convention: never import re)
+import torch
+import torch.fx as fx
 
 from torch_spyre._inductor.loop_info import copy_op_metadata
 from torch_spyre._inductor.op_spec import ProvenanceTransform
 from torch_spyre._inductor.provenance import (
     _SPYRE_PROV_HISTORY_ATTR,
+    build_debug_handle,
     preserve_provenance,
     merge_provenance,
     decompose_provenance,
     SpyreGraphTransformObserver,
     reset_provenance_warnings,
 )
+from torch_spyre._inductor.split_multi_ops import _make_intermediate_bufs
 
 
 @pytest.fixture
@@ -172,6 +177,120 @@ class TestDecomposeProvenance:
         decompose_provenance(old, [c0, c1], pass_name="split_multi_ops")
         c0.origins.add("x")
         assert c1.origins == {"a"}
+
+    def test_semantic_child_keeps_own_origin_and_primary(self):
+        old = _Buf(origins={"parent"}, origin_node="parent")
+        child = _Buf(origins={"child"}, origin_node="child")
+
+        decompose_provenance(
+            old,
+            [child],
+            pass_name="split_multi_ops",
+            inherit_origins=False,
+        )
+
+        assert child.origins == {"child"}
+        assert child.origin_node == "child"
+        assert getattr(child, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "decomposition", "split_multi_ops"
+        )
+
+
+class _FakeGraphLowering:
+    """Minimal lowering surface exercised by _make_intermediate_bufs."""
+
+    def __init__(self, graph, operations):
+        self.graph = graph
+        self.operations = operations
+        self.env = {}
+        self.name_to_buffer = {}
+
+    def run_node(self, node):
+        buffer = _Buf(
+            origins={node},
+            origin_node=node,
+            name=f"split_buf_{len(self.env)}",
+        )
+        tensor_box = SimpleNamespace(
+            data=SimpleNamespace(data=buffer),
+            get_name=buffer.get_name,
+        )
+        self.operations.append(buffer)
+        self.env[node] = tensor_box
+        return tensor_box
+
+
+class TestSplitMultiOpsProvenance:
+    def test_materialized_children_keep_source_identity_and_history(self):
+        graph = fx.Graph()
+        input_node = graph.placeholder("arg")
+        input_node.meta["val"] = torch.empty(2, device="meta")
+        orig_node = graph.call_function(
+            torch.ops.aten.add.Tensor,
+            (input_node, input_node),
+        )
+        orig_node.meta.update(
+            {
+                "stack_trace": (
+                    '  File "/tmp/model.py", line 41, in forward\n    return x + 1\n'
+                ),
+                "original_aten": torch.ops.aten.add.Tensor,
+            }
+        )
+
+        parent = _Buf(
+            origins={orig_node},
+            origin_node=orig_node,
+            name="parent_buf",
+        )
+        prior = ProvenanceTransform("rewrite", "prior_pass")
+        setattr(parent, _SPYRE_PROV_HISTORY_ATTR, (prior,))
+
+        operations = []
+        graph_lowering = _FakeGraphLowering(graph, operations)
+        _make_intermediate_bufs(
+            [
+                (
+                    "constant",
+                    1,
+                    (),
+                    {"fill_value": 1.0, "dtype": torch.float32},
+                ),
+                ("relu", 2, (0,), {}),
+            ],
+            {1: torch.float32, 2: torch.float32},
+            {0: input_node.name},
+            SimpleNamespace(dtype=torch.float32, device=torch.device("cpu")),
+            operations,
+            0,
+            graph_lowering,
+            orig_node,
+            parent,
+            final_op_name="add",
+        )
+
+        assert len(operations) == 2
+        handles = [build_debug_handle(buffer) for buffer in operations]
+        assert all(handle is not None for handle in handles)
+        assert {handle.source.to_str() for handle in handles} == {"/tmp/model.py:41:0"}
+        assert {handle.aten_op for handle in handles} == {
+            str(torch.ops.spyre.constant.default),
+            str(torch.ops.aten.relu.default),
+        }
+        assert len({handle.id for handle in handles}) == 2
+        assert len({handle.ir_chain for handle in handles}) == 2
+
+        expected_reasons = {"materialize constant", "materialize relu"}
+        for buffer, handle in zip(operations, handles):
+            child_node = next(iter(buffer.origins))
+            assert orig_node not in buffer.origins
+            assert buffer.origin_node is child_node
+            assert child_node.meta["from_node"][0].name == orig_node.name
+            assert child_node.meta["from_node"][0].pass_name == "split_multi_ops"
+            assert handle.transform_history[0] == prior
+            assert handle.transform_history[-1].kind == "decomposition"
+            assert handle.transform_history[-1].pass_name == "split_multi_ops"
+            assert handle.transform_history[-1].reason in expected_reasons
 
 
 class _NodeListTarget(list):
