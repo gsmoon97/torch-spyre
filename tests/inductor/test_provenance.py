@@ -220,6 +220,20 @@ class TestBuildDebugHandle:
     def test_empty_origins_returns_none(self):
         assert build_debug_handle(_buffer([])) is None
 
+    def test_level_zero_does_not_gate_handle_construction(self):
+        from torch._inductor import config as inductor_config
+
+        relu = _node(
+            "relu",
+            "/home/u/model.py",
+            42,
+            "aten.relu.default",
+        )
+        with inductor_config.patch("trace.provenance_tracking_level", 0):
+            handle = build_debug_handle(_buffer([relu], origin_node=relu, name="op2"))
+        assert handle is not None
+        assert handle.aten_op == "aten.relu.default"
+
     def test_single_op_with_origin_node(self):
         # Inductor's clean 1:1 case (e.g. pointwise relu): use origin_node.
         relu = _node("relu", "/home/u/model.py", 42, "aten.relu.default")

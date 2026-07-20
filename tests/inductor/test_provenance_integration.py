@@ -118,8 +118,11 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     prov_logger.setLevel(logging.WARNING)
     prov_logger.addHandler(handler)
     try:
-        with torch.no_grad():
-            torch.compile(model)(x)
+        # The observer is opt-in like upstream provenance tracing; the handle
+        # construction and forwarding assertions below remain unconditional.
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            with torch.no_grad():
+                torch.compile(model)(x)
     finally:
         prov_logger.removeHandler(handler)
         prov_logger.setLevel(previous_level)
