@@ -20,6 +20,7 @@ import logging.handlers
 import pytest
 import regex  # noqa: F401  (repo convention: never import re)
 
+from torch_spyre._inductor.loop_info import copy_op_metadata
 from torch_spyre._inductor.provenance import (
     _SPYRE_PROV_CONTEXT_ATTR,
     preserve_provenance,
@@ -80,12 +81,32 @@ class TestPreserveProvenance:
         preserve_provenance(old, new)
         assert new.origin_node == "b"
 
+    def test_does_not_clobber_existing_context(self):
+        old = _Buf()
+        setattr(old, _SPYRE_PROV_CONTEXT_ATTR, "old_context")
+        new = _Buf()
+        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, "new_context")
+        preserve_provenance(old, new)
+        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "new_context"
+
     def test_unions_into_existing_origins(self):
         # origins is unioned in place, not rebound: pre-existing origins survive.
         old = _Buf(origins={"a"})
         new = _Buf(origins={"z"})
         preserve_provenance(old, new)
         assert new.origins == {"a", "z"}
+
+
+class TestCopyOpMetadata:
+    def test_does_not_copy_provenance_context(self):
+        old = _Buf()
+        setattr(old, _SPYRE_PROV_CONTEXT_ATTR, "source_context")
+        new = _Buf()
+        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, "destination_context")
+
+        copy_op_metadata(old, new)
+
+        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "destination_context"
 
 
 class TestMergeProvenance:

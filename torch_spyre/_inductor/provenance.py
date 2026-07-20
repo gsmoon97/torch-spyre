@@ -223,7 +223,7 @@ def preserve_provenance(old: Any, new: Any) -> None:
     if node is not None and getattr(new, "origin_node", None) is None:
         new.origin_node = node
     ctx = getattr(old, _SPYRE_PROV_CONTEXT_ATTR, None)
-    if ctx is not None:
+    if ctx is not None and getattr(new, _SPYRE_PROV_CONTEXT_ATTR, None) is None:
         setattr(new, _SPYRE_PROV_CONTEXT_ATTR, ctx)
 
 

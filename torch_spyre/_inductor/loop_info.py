@@ -23,10 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-
 import sympy
-
-from torch_spyre._inductor.provenance import _SPYRE_PROV_CONTEXT_ATTR
 
 if TYPE_CHECKING:
     from torch._inductor.ir import ComputedBuffer
@@ -106,19 +103,16 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
-    # Pass-level fusion/decomposition context (set by the
-    # explicit provenance helpers); read by
-    # provenance.build_debug_handle into DebugHandle.fusion_context.
-    _SPYRE_PROV_CONTEXT_ATTR,
 )
 
 
 def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
-    """Copy all Spyre pass metadata from src to dst.
+    """Copy non-provenance Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
     dim_hints, work-division hint metadata, and coarse-tiling attrs are not
-    silently dropped.
+    silently dropped. Source provenance is owned by the helpers in
+    ``provenance.py`` and is deliberately excluded from this bulk copy.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):
