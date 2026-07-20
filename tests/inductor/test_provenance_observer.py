@@ -21,8 +21,9 @@ import pytest
 import regex  # noqa: F401  (repo convention: never import re)
 
 from torch_spyre._inductor.loop_info import copy_op_metadata
+from torch_spyre._inductor.op_spec import ProvenanceTransform
 from torch_spyre._inductor.provenance import (
-    _SPYRE_PROV_CONTEXT_ATTR,
+    _SPYRE_PROV_HISTORY_ATTR,
     preserve_provenance,
     merge_provenance,
     decompose_provenance,
@@ -67,12 +68,13 @@ class TestPreserveProvenance:
         assert new.origins == {"a", "b"}
         assert new.origin_node == "a"
 
-    def test_copies_context(self):
+    def test_copies_history(self):
         old = _Buf(origins={"a"})
-        setattr(old, _SPYRE_PROV_CONTEXT_ATTR, "ctx")
+        history = (ProvenanceTransform("fusion", "fuse"),)
+        setattr(old, _SPYRE_PROV_HISTORY_ATTR, history)
         new = _Buf()
         preserve_provenance(old, new)
-        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "ctx"
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == history
 
     def test_does_not_clobber_existing_origin_node(self):
         # A pass that already set origin_node on the new buffer keeps its value.
@@ -81,13 +83,30 @@ class TestPreserveProvenance:
         preserve_provenance(old, new)
         assert new.origin_node == "b"
 
-    def test_does_not_clobber_existing_context(self):
+    def test_combines_existing_histories_without_clobbering(self):
         old = _Buf()
-        setattr(old, _SPYRE_PROV_CONTEXT_ATTR, "old_context")
         new = _Buf()
-        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, "new_context")
+        old_transform = ProvenanceTransform("fusion", "old_fusion")
+        new_transform = ProvenanceTransform("rewrite", "new_rewrite")
+        setattr(old, _SPYRE_PROV_HISTORY_ATTR, (old_transform,))
+        setattr(new, _SPYRE_PROV_HISTORY_ATTR, (new_transform,))
+
         preserve_provenance(old, new)
-        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "new_context"
+
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == (
+            old_transform,
+            new_transform,
+        )
+
+    def test_preserves_legitimate_repeated_records(self):
+        old = _Buf()
+        new = _Buf()
+        repeated = ProvenanceTransform("rewrite", "same_pass")
+        history = (repeated, repeated)
+        setattr(old, _SPYRE_PROV_HISTORY_ATTR, history)
+        setattr(new, _SPYRE_PROV_HISTORY_ATTR, history)
+        preserve_provenance(old, new)
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == history
 
     def test_unions_into_existing_origins(self):
         # origins is unioned in place, not rebound: pre-existing origins survive.
@@ -98,30 +117,39 @@ class TestPreserveProvenance:
 
 
 class TestCopyOpMetadata:
-    def test_does_not_copy_provenance_context(self):
+    def test_does_not_copy_provenance_history(self):
         old = _Buf()
-        setattr(old, _SPYRE_PROV_CONTEXT_ATTR, "source_context")
+        source_history = (ProvenanceTransform("fusion", "source_fusion"),)
+        destination_history = (ProvenanceTransform("rewrite", "destination"),)
+        setattr(old, _SPYRE_PROV_HISTORY_ATTR, source_history)
         new = _Buf()
-        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, "destination_context")
+        setattr(new, _SPYRE_PROV_HISTORY_ATTR, destination_history)
 
         copy_op_metadata(old, new)
 
-        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "destination_context"
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == destination_history
 
 
 class TestMergeProvenance:
-    def test_unions_origins_and_sets_context(self):
+    def test_unions_origins_and_appends_fusion_record(self):
         s1, s2 = _Buf(origins={"a"}), _Buf(origins={"b", "c"})
         new = _Buf()
-        merge_provenance([s1, s2], new, context="spyre_fuse_nodes")
+        merge_provenance(
+            [s1, s2],
+            new,
+            pass_name="spyre_fuse_nodes",
+            reason="same tile",
+        )
         assert new.origins == {"a", "b", "c"}
-        assert getattr(new, _SPYRE_PROV_CONTEXT_ATTR) == "spyre_fuse_nodes"
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "fusion", "spyre_fuse_nodes", "same tile"
+        )
 
     def test_clears_single_source_origin_node(self):
         s1 = _Buf(origins={"a"}, origin_node="a")
         s2 = _Buf(origins={"b"}, origin_node="b")
         new = _Buf(origin_node="a")
-        merge_provenance([s1, s2], new, context="spyre_fuse_nodes")
+        merge_provenance([s1, s2], new, pass_name="spyre_fuse_nodes")
         assert new.origin_node is None
 
 
@@ -129,17 +157,19 @@ class TestDecomposeProvenance:
     def test_each_child_inherits_parent(self):
         old = _Buf(origins={"a"}, origin_node="a")
         c0, c1 = _Buf(name="c0"), _Buf(name="c1")
-        decompose_provenance(old, [c0, c1], context="split_multi_ops")
+        decompose_provenance(old, [c0, c1], pass_name="split_multi_ops")
         for c in (c0, c1):
             assert c.origins == {"a"}
             assert c.origin_node == "a"
-            assert getattr(c, _SPYRE_PROV_CONTEXT_ATTR) == "split_multi_ops"
+            assert getattr(c, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+                "decomposition", "split_multi_ops"
+            )
 
     def test_children_have_independent_origins(self):
         # Each child gets its own origins set; mutating one must not affect another.
         old = _Buf(origins={"a"})
         c0, c1 = _Buf(name="c0"), _Buf(name="c1")
-        decompose_provenance(old, [c0, c1], context="split_multi_ops")
+        decompose_provenance(old, [c0, c1], pass_name="split_multi_ops")
         c0.origins.add("x")
         assert c1.origins == {"a"}
 
@@ -227,6 +257,14 @@ class TestObserverDetection:
         with SpyreGraphTransformObserver(target, "drops_origin_node", kind="node"):
             b.origin_node = None  # origins intact, authoritative pointer gone
         assert any("drops_origin_node" in r.getMessage() for r in prov_logs)
+
+    def test_transform_history_loss_warns(self, prov_logs):
+        b = _Buf(origins={"a"})
+        setattr(b, _SPYRE_PROV_HISTORY_ATTR, (ProvenanceTransform("fusion", "fuse"),))
+        target = _NodeListTarget([_unit(b)])
+        with SpyreGraphTransformObserver(target, "drops_history", kind="node"):
+            setattr(b, _SPYRE_PROV_HISTORY_ATTR, ())
+        assert any("transformation history" in r.getMessage() for r in prov_logs)
 
     def test_sourceless_creation_pass_origin_node_loss_warns(self, prov_logs):
         # Source-less helper creation does not excuse provenance loss on an
