@@ -29,7 +29,11 @@ from typing import Any, Sequence
 import regex
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import DebugHandle, SourceLoc
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    ProvenanceTransform,
+    SourceLoc,
+)
 
 
 _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
@@ -40,11 +44,10 @@ _FRAME_RE = regex.compile(r'File "([^"]+)", line (\d+)')
 # compile that hits the same regression.
 logger = get_inductor_logger("provenance")
 
-# Buffer attribute the explicit provenance helpers stamp
-# with the pass-level fusion or decomposition context (a FusedLoc-style metadata
-# tag). Carried across pass rewrites via loop_info._SPYRE_METADATA_ATTRS and
-# folded into DebugHandle.fusion_context by build_debug_handle.
-_SPYRE_PROV_CONTEXT_ATTR = "_spyre_prov_context"
+# Buffer attribute owned exclusively by the explicit provenance helpers. The
+# immutable records survive 1:1 reconstruction and retain multiple lower-IR
+# transformations instead of collapsing them into one scalar context string.
+_SPYRE_PROV_HISTORY_ATTR = "_spyre_prov_history"
 
 
 def _stable_id(
@@ -190,8 +193,56 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
         aten_op=aten_op,
         ir_chain=ir_chain,
         fused_from=fused_from,
-        fusion_context=getattr(buffer, _SPYRE_PROV_CONTEXT_ATTR, None),
+        transform_history=_transform_history_of(buffer),
     )
+
+
+def _transform_history_of(carrier: Any) -> tuple[ProvenanceTransform, ...]:
+    """Return a carrier's immutable lower-IR transformation history."""
+    return tuple(getattr(carrier, _SPYRE_PROV_HISTORY_ATTR, ()) or ())
+
+
+def _combined_transform_history(
+    *carriers: Any,
+) -> tuple[ProvenanceTransform, ...]:
+    """Combine histories in source order, coalescing shared prefixes."""
+    combined: list[ProvenanceTransform] = []
+    for carrier in carriers:
+        history = _transform_history_of(carrier)
+        common_prefix = 0
+        limit = min(len(combined), len(history))
+        while (
+            common_prefix < limit and combined[common_prefix] == history[common_prefix]
+        ):
+            common_prefix += 1
+        combined.extend(history[common_prefix:])
+    return tuple(combined)
+
+
+def _history_is_subsequence(
+    before: tuple[ProvenanceTransform, ...],
+    after: tuple[ProvenanceTransform, ...],
+) -> bool:
+    """Return whether every prior record survives in the same relative order."""
+    remaining = iter(after)
+    return all(
+        any(candidate == transform for candidate in remaining) for transform in before
+    )
+
+
+def _set_transform_history(
+    carrier: Any, history: tuple[ProvenanceTransform, ...]
+) -> None:
+    """Set an immutable transformation history on a provenance carrier."""
+    setattr(carrier, _SPYRE_PROV_HISTORY_ATTR, history)
+
+
+def _append_transform(
+    carriers: Sequence[Any], new: Any, transform: ProvenanceTransform
+) -> None:
+    """Combine source/destination histories and append one new transform."""
+    history = _combined_transform_history(*carriers, new)
+    _set_transform_history(new, (*history, transform))
 
 
 def _union_origins(src: Any, dst: Any) -> None:
@@ -209,48 +260,68 @@ def _union_origins(src: Any, dst: Any) -> None:
 
 
 def preserve_provenance(old: Any, new: Any) -> None:
-    """1:1 rewrite: carry origins/origin_node/context from old onto new.
+    """1:1 rewrite: carry origins, primary node, and history onto new.
 
-    Targets Buffer/ComputedBuffer, which are ``@ir_dataclass(frozen=False)``, so
-    scalar fields use plain assignment (as ``replace_computed_buffer_body`` /
-    ``copy_op_metadata`` do). ``origins`` is unioned in place. Scalars are set
-    only when unset on new, so a pass that already populated them is not
-    clobbered. Best-effort is a boundary concern (the observer / create_op_spec
-    already wrap calls in try/except); no per-write guard here.
+    Targets Buffer/ComputedBuffer, whose ``origins`` container is mutable even
+    though the surrounding IR dataclass may be frozen. ``origins`` is unioned;
+    ``origin_node`` keeps a value deliberately set by the pass. Transformation
+    histories are combined in old-then-new order, so destination records remain
+    the most recent without discarding the old buffer's lineage.
     """
     _union_origins(old, new)
     node = getattr(old, "origin_node", None)
     if node is not None and getattr(new, "origin_node", None) is None:
         new.origin_node = node
-    ctx = getattr(old, _SPYRE_PROV_CONTEXT_ATTR, None)
-    if ctx is not None and getattr(new, _SPYRE_PROV_CONTEXT_ATTR, None) is None:
-        setattr(new, _SPYRE_PROV_CONTEXT_ATTR, ctx)
+    history = _combined_transform_history(old, new)
+    if history:
+        _set_transform_history(new, history)
 
 
-def merge_provenance(sources: Sequence[Any], new: Any, context: str) -> None:
-    """n->1 fusion: union all origins, clear a stale primary, record context."""
-    for s in sources:
-        _union_origins(s, new)
+def merge_provenance(
+    sources: Sequence[Any],
+    new: Any,
+    pass_name: str,
+    reason: str | None = None,
+) -> None:
+    """n->1 fusion: union origins, clear a stale primary, append a record."""
+    for source in sources:
+        _union_origins(source, new)
     # A fused buffer has no intrinsically authoritative constituent. Clear any
     # primary inherited from the object used to initialize ``new``. The builder
     # then derives source and ATen headlines independently from the full set: a
     # field is populated only when there is one distinct non-None value;
     # conflicting values stay None, and fused_from remains authoritative.
     new.origin_node = None
-    setattr(new, _SPYRE_PROV_CONTEXT_ATTR, context)
+    transform = ProvenanceTransform(
+        kind="fusion",
+        pass_name=pass_name,
+        reason=reason,
+    )
+    _append_transform(sources, new, transform)
 
 
-def decompose_provenance(old: Any, news: Sequence[Any], context: str) -> None:
-    """1->n decomposition: each child inherits old's origins/node; record context.
+def decompose_provenance(
+    old: Any,
+    news: Sequence[Any],
+    pass_name: str,
+    reason: str | None = None,
+) -> None:
+    """1->n decomposition: each child inherits and extends old's provenance.
 
-    Each child unions old's origins into its own (independent) origins set.
+    Each child unions old's origins into its own independent origins set and
+    receives its own immutable history tuple ending in the decomposition record.
     """
     node = getattr(old, "origin_node", None)
+    transform = ProvenanceTransform(
+        kind="decomposition",
+        pass_name=pass_name,
+        reason=reason,
+    )
     for child in news:
         _union_origins(old, child)
         if node is not None and getattr(child, "origin_node", None) is None:
             child.origin_node = node
-        setattr(child, _SPYRE_PROV_CONTEXT_ATTR, context)
+        _append_transform((old,), child, transform)
 
 
 # Passes whose newly-created buffers are legitimately source-less
@@ -336,21 +407,23 @@ class SpyreGraphTransformObserver:
     """Detects provenance (``origins``) dropped by a Spyre pass.
 
     Context manager wrapping one pass. On exit it compares each buffer's
-    ``origins`` against a pre-pass snapshot and warns once per pass when an
-    existing buffer's origins were cleared or partially dropped, or a new
-    buffer was created without origins. Declared source-less creations and
+    origins, primary node, and transformation history against a pre-pass
+    snapshot. It warns once per pass when existing provenance was dropped or a
+    new buffer was created without origins. Declared source-less creations and
     intentional remaps use separate exemptions. Best-effort: never raises into
     the compile path; disabled by ``TORCH_SPYRE_PROVENANCE=0``.
 
-    It does NOT forward provenance or set fusion context — that is the job of the
-    preserve/merge/decompose helpers and the existing buffer-reconstruction path.
+    It does NOT forward provenance or record transformations — that is the job
+    of the explicit helpers and existing buffer-reconstruction path.
     """
 
     def __init__(self, target: Any, pass_name: str, kind: str) -> None:
         self.target = target
         self.pass_name = pass_name
         self.kind = kind
-        self._before: dict[Any, tuple[frozenset, Any]] = {}
+        self._before: dict[
+            Any, tuple[frozenset, Any, tuple[ProvenanceTransform, ...]]
+        ] = {}
         self._active = _provenance_enabled() and kind != "graph"
 
     def __enter__(self) -> "SpyreGraphTransformObserver":
@@ -361,6 +434,7 @@ class SpyreGraphTransformObserver:
                 self._before[_unit_key(u)] = (
                     _origins_of(u),
                     getattr(u, "origin_node", None),
+                    _transform_history_of(u),
                 )
         except Exception:
             self._active = False
@@ -382,7 +456,7 @@ class SpyreGraphTransformObserver:
             snap = self._before.get(_unit_key(u))
             now = _origins_of(u)
             if snap is not None:
-                before, before_node = snap
+                before, before_node, before_history = snap
                 # Warn on ANY lost origin, not only a complete drop: a fused
                 # buffer going {a, b} -> {a} silently loses one source. A pass
                 # that legitimately remaps origins can declare that separately
@@ -400,6 +474,14 @@ class SpyreGraphTransformObserver:
                     self._warn(
                         "dropped origin_node (authoritative provenance) on an "
                         "existing buffer"
+                    )
+                now_history = _transform_history_of(u)
+                if (
+                    not _history_is_subsequence(before_history, now_history)
+                    and not remap_exempt
+                ):
+                    self._warn(
+                        "dropped lower-IR transformation history on an existing buffer"
                     )
             elif not now and not creation_exempt:
                 self._warn(
