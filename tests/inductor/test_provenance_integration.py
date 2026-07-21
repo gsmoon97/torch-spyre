@@ -19,7 +19,6 @@ import logging.handlers
 import os
 
 import pytest
-import regex  # noqa: F401  (repo convention: never import re)
 import torch
 
 
