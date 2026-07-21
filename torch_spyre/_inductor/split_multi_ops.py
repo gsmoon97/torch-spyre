@@ -523,7 +523,7 @@ def _make_intermediate_bufs(
             # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
             # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
-            # Set origins using object.__setattr__ to work around dataclass frozen fields.
+            # This child node is the sole semantic origin of the new buffer.
             object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
             decompose_provenance(
                 orig_buffer,
@@ -563,7 +563,7 @@ def _make_intermediate_bufs(
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        # Set origins using object.__setattr__ to work around dataclass frozen fields.
+        # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
         decompose_provenance(
             orig_buffer,

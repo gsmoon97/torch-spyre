@@ -14,12 +14,12 @@
 
 """Device-free unit tests for the provenance forwarding helpers and observer."""
 
+import dataclasses
 import logging
 import logging.handlers
 from types import SimpleNamespace
 
 import pytest
-import regex  # noqa: F401  (repo convention: never import re)
 import torch
 import torch.fx as fx
 from torch._inductor import config as inductor_config
@@ -65,6 +65,14 @@ class _Buf:
 
     def get_name(self):
         return self._name
+
+
+@dataclasses.dataclass(frozen=True)
+class _FrozenBuf:
+    """Frozen provenance carrier with a mutable origins container."""
+
+    origins: set[object] = dataclasses.field(default_factory=set)
+    origin_node: object | None = None
 
 
 class TestPreserveProvenance:
@@ -183,6 +191,23 @@ class TestDecomposeProvenance:
     def test_semantic_child_keeps_own_origin_and_primary(self):
         old = _Buf(origins={"parent"}, origin_node="parent")
         child = _Buf(origins={"child"}, origin_node="child")
+
+        decompose_provenance(
+            old,
+            [child],
+            pass_name="split_multi_ops",
+            inherit_origins=False,
+        )
+
+        assert child.origins == {"child"}
+        assert child.origin_node == "child"
+        assert getattr(child, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "decomposition", "split_multi_ops"
+        )
+
+    def test_semantic_frozen_child_records_history(self):
+        old = _Buf(origins={"parent"}, origin_node="parent")
+        child = _FrozenBuf(origins={"child"}, origin_node="child")
 
         decompose_provenance(
             old,

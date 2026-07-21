@@ -233,7 +233,7 @@ def _set_transform_history(
     carrier: Any, history: tuple[ProvenanceTransform, ...]
 ) -> None:
     """Set an immutable transformation history on a provenance carrier."""
-    setattr(carrier, _SPYRE_PROV_HISTORY_ATTR, history)
+    object.__setattr__(carrier, _SPYRE_PROV_HISTORY_ATTR, history)
 
 
 def _append_transform(
@@ -261,11 +261,11 @@ def _union_origins(src: Any, dst: Any) -> None:
 def preserve_provenance(old: Any, new: Any) -> None:
     """1:1 rewrite: carry origins, primary node, and history onto new.
 
-    Targets Buffer/ComputedBuffer, whose ``origins`` container is mutable even
-    though the surrounding IR dataclass may be frozen. ``origins`` is unioned;
-    ``origin_node`` keeps a value deliberately set by the pass. Transformation
-    histories are combined in old-then-new order, so destination records remain
-    the most recent without discarding the old buffer's lineage.
+    Targets Buffer/ComputedBuffer, whose ``origins`` container is mutable.
+    ``origins`` is unioned; ``origin_node`` keeps a value deliberately set by
+    the pass. Transformation histories are combined in old-then-new order, so
+    destination records remain the most recent without discarding the old
+    buffer's lineage.
     """
     _union_origins(old, new)
     node = getattr(old, "origin_node", None)
