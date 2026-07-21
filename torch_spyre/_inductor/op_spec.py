@@ -119,16 +119,6 @@ class DebugHandle:
     fused_from: tuple["DebugHandle", ...] = ()
     transform_history: tuple[ProvenanceTransform, ...] = ()
 
-    @property
-    def fusion_context(self) -> str | None:
-        """Compatibility label derived from the most recent fusion record."""
-        for transform in reversed(self.transform_history):
-            if transform.kind == "fusion":
-                if transform.reason is not None:
-                    return f"{transform.pass_name}: {transform.reason}"
-                return transform.pass_name
-        return None
-
     def to_dict(self) -> dict[str, object]:
         return {
             # id is serialized as a string: a 63-bit value exceeds JS
@@ -141,7 +131,6 @@ class DebugHandle:
             "ir_chain": list(self.ir_chain),
             "fused_from": [h.to_dict() for h in self.fused_from],
             "transform_history": [t.to_dict() for t in self.transform_history],
-            "fusion_context": self.fusion_context,
         }
 
 

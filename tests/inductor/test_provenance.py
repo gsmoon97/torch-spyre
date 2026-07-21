@@ -155,6 +155,14 @@ class TestDebugHandle:
             transform_history=(ProvenanceTransform("fusion", "fuse_ops", "same tile"),),
         )
         d = h.to_dict()
+        assert set(d) == {
+            "id",
+            "source",
+            "aten_op",
+            "ir_chain",
+            "fused_from",
+            "transform_history",
+        }
         assert d["source"] == {
             "file": "m.py",
             "start_line": 5,
@@ -172,7 +180,6 @@ class TestDebugHandle:
                 "reason": "same tile",
             }
         ]
-        assert d["fusion_context"] == "fuse_ops: same tile"
 
     def test_to_dict_serializes_id_as_string_for_js_safety(self):
         # A 63-bit id exceeds JS Number.MAX_SAFE_INTEGER (2**53-1); a JSON number
@@ -301,7 +308,7 @@ class TestBuildDebugHandle:
 
     def test_reads_structured_transform_history(self):
         # Explicit provenance helpers stamp immutable records on a buffer;
-        # build_debug_handle carries the history and derives fusion_context.
+        # build_debug_handle carries the complete history.
         from torch_spyre._inductor.provenance import _SPYRE_PROV_HISTORY_ATTR
 
         n = _node("mm", "/m.py", 5, "aten.mm.default")
@@ -314,23 +321,6 @@ class TestBuildDebugHandle:
         handle = build_debug_handle(buf)
         assert handle is not None
         assert handle.transform_history == history
-        assert handle.fusion_context == "spyre_fuse_nodes: same tile"
-
-    def test_fusion_context_absent_is_none(self):
-        n = _node("mm", "/m.py", 5, "aten.mm.default")
-        assert build_debug_handle(_buffer([n])).fusion_context is None
-
-    def test_decomposition_does_not_create_fusion_context(self):
-        from torch_spyre._inductor.provenance import _SPYRE_PROV_HISTORY_ATTR
-
-        n = _node("split", "/m.py", 5, "aten.split.Tensor")
-        buf = _buffer([n])
-        setattr(
-            buf,
-            _SPYRE_PROV_HISTORY_ATTR,
-            (ProvenanceTransform("decomposition", "split"),),
-        )
-        assert build_debug_handle(buf).fusion_context is None
 
     def test_single_origin_no_trace_is_honest_empty(self):
         # A single compiler-generated origin with no stack_trace and no

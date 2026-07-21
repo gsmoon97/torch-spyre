@@ -132,8 +132,8 @@ Reuse the existing helpers rather than setting `origins` by hand:
 Transformation history is an immutable tuple of `ProvenanceTransform` records.
 Each record separates `kind`, `pass_name`, and optional `reason`; do not
 reintroduce a scalar context attribute. `DebugHandle.transform_history` is the
-authoritative serialized form. The legacy `fusion_context` JSON field is
-derived from the most recent fusion record for compatibility.
+authoritative serialized form for fusion, decomposition, clone, rewrite, and
+remap steps.
 
 When a lower-IR pass creates a fresh semantic FX node, retain the parent source
 lineage while assigning the child's own operation identity. In practice, copy
