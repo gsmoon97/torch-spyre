@@ -205,7 +205,7 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         # so clear the dedup here so each compile warns afresh.
         reset_provenance_warnings()
         for pass_fn in self.passes:
-            name = getattr(pass_fn, "__name__", type(pass_fn).__name__)
+            name = _get_pass_name(pass_fn)
             # The observer snapshots the list it is given at __enter__; these
             # passes regroup SchedulerNodes while the underlying
             # ComputedBuffers persist, so in-place origin drops are detected.
@@ -401,16 +401,15 @@ class CustomPreSchedulingPasses:
             )
 
         for pass_fn in self.passes:
-            name = getattr(pass_fn, "__name__", type(pass_fn).__name__)
+            pass_name = _get_pass_name(pass_fn)
             # `graph` is the same object throughout -- passes mutate
             # `graph.operations` in place -- so before/after reconciliation
             # is exact here.
-            with SpyreGraphTransformObserver(graph, name, kind="graphlowering"):
+            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
                 t0 = time.perf_counter()
                 pass_fn(graph)
                 elapsed_ms = (time.perf_counter() - t0) * 1000
 
-            pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "elapsed %5dms  %s",
