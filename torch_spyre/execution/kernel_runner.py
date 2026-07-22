@@ -48,7 +48,14 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.profiler_provenance = profiler_provenance
-        self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
+        spyrecode_dir = code_dir + "/spyreCodeDir"
+        if profiler_provenance is None:
+            self.jobplan = prepare_kernel(spyrecode_dir)
+        else:
+            self.jobplan = prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_provenance.event_name,
+            )
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, **kw_args):

@@ -211,9 +211,11 @@ static int64_t safe_stoll(const std::string& str,
 }
 
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
-                               const SpyreStream* stream)
+                               const SpyreStream* stream,
+                               std::optional<std::string> profiler_name)
     : spyrecode_dir_(spyrecode_dir),
-      stream_(stream ? *stream : getCurrentStream()) {
+      stream_(stream ? *stream : getCurrentStream()),
+      profiler_name_(std::move(profiler_name)) {
   // Validate directory exists
   TORCH_CHECK(std::filesystem::exists(spyrecode_dir_),
               "SpyreCode directory does not exist: ", spyrecode_dir_.string());
@@ -347,7 +349,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
   // The step index disambiguates multi-compute plans.
   std::string name;
-  if (cmd.contains("name") && cmd["name"].is_string()) {
+  if (profiler_name_.has_value() && !profiler_name_->empty()) {
+    name = *profiler_name_ + "#" + std::to_string(step_idx);
+  } else if (cmd.contains("name") && cmd["name"].is_string()) {
     name = cmd["name"].get<std::string>();
   } else {
     auto inner = spyrecode_dir_.filename();  // spyreCodeDir
@@ -356,6 +360,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
     name = (sdsc / inner / "bundle.mlir").string() + "#" +
            std::to_string(step_idx);
   }
+  // TODO(PyTorch 2.12): retain this name as the raw-trace compatibility join
+  // when the registered PrivateUse1 profiler also emits structured
+  // debug_handles metadata for the same kernel provenance key.
 
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in
@@ -736,9 +743,10 @@ std::unique_ptr<JobPlan> JobPlanBuilder::build() {
   return job_plan;
 }
 
-std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
-                                       const SpyreStream* stream) {
-  JobPlanBuilder builder(spyrecode_dir, stream);
+std::unique_ptr<JobPlan> prepareKernel(
+    const std::string& spyrecode_dir, const SpyreStream* stream,
+    std::optional<std::string> profiler_name) {
+  JobPlanBuilder builder(spyrecode_dir, stream, std::move(profiler_name));
   auto jobplan = builder.build();
 
   // Dump JobPlan if debug logging is enabled

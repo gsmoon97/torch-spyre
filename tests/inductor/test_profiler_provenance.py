@@ -218,7 +218,7 @@ class TestKernelProvenancePropagation:
         with patch(
             "torch_spyre.execution.kernel_runner.prepare_kernel",
             return_value="jobplan",
-        ):
+        ) as prepare_kernel:
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
@@ -227,3 +227,17 @@ class TestKernelProvenancePropagation:
 
         assert runner.profiler_provenance is descriptor
         assert runner.jobplan == "jobplan"
+        prepare_kernel.assert_called_once_with(
+            "/tmp/kernel/spyreCodeDir",
+            profiler_name=descriptor.event_name,
+        )
+
+    def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
+        with patch(
+            "torch_spyre.execution.kernel_runner.prepare_kernel",
+            return_value="jobplan",
+        ) as prepare_kernel:
+            runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
+
+        assert runner.profiler_provenance is None
+        prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
