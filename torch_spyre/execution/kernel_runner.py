@@ -15,6 +15,7 @@
 import torch
 from torch_spyre._C import launch_jobplan, prepare_kernel
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.profiler_provenance import KernelProvenanceDescriptor
 from torch_spyre.profiler._ffdc import (
     CATEGORY_RUNTIME_LAUNCH,
     CATEGORY_UNIMPLEMENTED,
@@ -38,9 +39,15 @@ class SpyreUnimplementedRunner:
 
 
 class SpyreSDSCKernelRunner:
-    def __init__(self, name: str, code_dir: str):
+    def __init__(
+        self,
+        name: str,
+        code_dir: str,
+        profiler_provenance: KernelProvenanceDescriptor | None = None,
+    ):
         self.kernel_name = name
         self.code_dir = code_dir
+        self.profiler_provenance = profiler_provenance
         self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
     @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)

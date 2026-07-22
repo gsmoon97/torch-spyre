@@ -16,8 +16,11 @@
 
 import ctypes
 import dataclasses
+from unittest.mock import patch
 
 import pytest
+
+import torch  # noqa: F401
 from sympy import Integer
 
 from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, SourceLoc
@@ -26,6 +29,8 @@ from torch_spyre._inductor.profiler_provenance import (
     build_kernel_provenance_descriptor,
     extract_kernel_provenance_key,
 )
+from torch_spyre.execution.async_compile import SpyreAsyncCompile
+from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
 
 def _handle(
@@ -177,3 +182,48 @@ class TestKernelProvenanceEventName:
         assert extract_kernel_provenance_key("sdsc_mm_0") is None
         assert extract_kernel_provenance_key("spyre_kernel_not-hex_fused") is None
         assert extract_kernel_provenance_key("xspyre_kernel_0123456789abcdef") is None
+
+
+class TestKernelProvenancePropagation:
+    def test_async_compile_builds_descriptor_from_finalized_specs(self):
+        specs = [
+            _op(_handle(9)),
+            LoopSpec(count=Integer(2), body=[_op(_handle(12))]),
+        ]
+        runner = object()
+
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ) as runner_type,
+        ):
+            result = SpyreAsyncCompile().sdsc("sdsc_fused_mm_0", specs)
+
+        assert result is runner
+        descriptor = runner_type.call_args.kwargs["profiler_provenance"]
+        assert descriptor.debug_handle_ids == ("9", "12")
+        assert extract_kernel_provenance_key(descriptor.event_name) == descriptor.key
+
+    def test_runner_retains_descriptor_for_runtime_forwarding(self):
+        descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
+        assert descriptor is not None
+
+        with patch(
+            "torch_spyre.execution.kernel_runner.prepare_kernel",
+            return_value="jobplan",
+        ):
+            runner = SpyreSDSCKernelRunner(
+                "sdsc_fused_mm_0",
+                "/tmp/kernel",
+                profiler_provenance=descriptor,
+            )
+
+        assert runner.profiler_provenance is descriptor
+        assert runner.jobplan == "jobplan"
