@@ -28,6 +28,9 @@ from torch_spyre._inductor.op_spec import (
     UnimplementedOp,
     find_unimplemented,
 )
+from torch_spyre._inductor.profiler_provenance import (
+    build_kernel_provenance_descriptor,
+)
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
@@ -81,6 +84,12 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs)
 
+        # This is the common fresh-compile/cache-reload boundary: generated
+        # wrappers have reconstructed the finalized OpSpecs before calling
+        # sdsc(). Derive the version-neutral identity here so PyTorch 2.11 and
+        # 2.12 use the same descriptor without changing the wrapper call ABI.
+        profiler_provenance = build_kernel_provenance_descriptor(specs)
+
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
@@ -95,7 +104,11 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
                 raise
 
-        return SpyreSDSCKernelRunner(kernel_name, output_dir)
+        return SpyreSDSCKernelRunner(
+            kernel_name,
+            output_dir,
+            profiler_provenance=profiler_provenance,
+        )
 
     def ktir(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
