@@ -162,6 +162,64 @@ class TestPrepareKernel:
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
 
+    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+        """Compiler provenance name identifies every device-compute step."""
+        profiler_name = "spyre_kernel_fused_at_unknown_0_0123456789abcdef"
+        job_exec_plan = [
+            {
+                "command": "ComputeOnDevice",
+                "properties": {
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            },
+            {
+                "command": "ComputeOnDevice",
+                "properties": {"job_bin_ptr": "120259084288"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+
+    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+        """Existing named SpyreCode plans retain their current behavior."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == "legacy_name"
+
+    def test_directory_compute_name_fallback_is_preserved(self):
+        """Older unnamed plans retain the directory-derived fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert job_plan.get_step_name(0) == expected
+
     def test_prepare_kernel_invalid_directory(self):
         """Test PrepareKernel with invalid directory."""
         with pytest.raises(RuntimeError, match="SpyreCode directory does not exist"):
