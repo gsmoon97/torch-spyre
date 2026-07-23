@@ -475,6 +475,7 @@ class TestCodegenRoundTrip:
         "TensorArg": TensorArg,
         "DebugHandle": DebugHandle,
         "SourceLoc": SourceLoc,
+        "ProvenanceTransform": ProvenanceTransform,
         "DataFormats": DataFormats,
         "sympify": sympify,
     }
@@ -501,6 +502,24 @@ class TestCodegenRoundTrip:
         )
         result = self._roundtrip(_threadable_op_spec(debug_handle=h))
         assert result.debug_handle == h
+
+    def test_transform_history_survives_codegen_roundtrip(self):
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+            transform_history=(
+                ProvenanceTransform(
+                    kind="decomposition",
+                    pass_name="split_multi_ops",
+                    reason="materialize add",
+                ),
+            ),
+        )
+        result = self._roundtrip(_threadable_op_spec(debug_handle=h))
+        assert result.debug_handle == h
+        assert result.debug_handle.transform_history == h.transform_history
 
     def test_fused_handle_with_children_survives_roundtrip(self):
         # The n->1 fusion case: nested fused_from must survive too.
