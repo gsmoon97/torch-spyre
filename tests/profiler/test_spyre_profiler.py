@@ -221,7 +221,7 @@ def test_synchronize_callable():
 def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
     """A real device-kernel event resolves to compiler DebugHandles."""
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
-    from torch_spyre._inductor.profiler_provenance import (
+    from torch_spyre._inductor.profiler_event import (
         AIUPTI_ACTIVITY_NAME_MAX_BYTES,
         extract_kernel_provenance_key,
     )
@@ -242,8 +242,10 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
                     collect(spec.body)
 
         collect(specs)
-        if runner.profiler_provenance is not None:
-            captures.append((runner.profiler_provenance, tuple(handles)))
+        if runner.kernel_provenance is not None:
+            captures.append(
+                (runner.kernel_provenance, runner.profiler_event_name, tuple(handles))
+            )
         return runner
 
     monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture_sdsc)
@@ -274,7 +276,8 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
             trace = json.load(f)
 
     events = trace["traceEvents"]
-    for descriptor, handles in captures:
+    for descriptor, event_name, handles in captures:
+        assert event_name is not None
         expected_ids = tuple(dict.fromkeys(str(handle.id) for handle in handles))
         assert descriptor.debug_handle_ids == expected_ids
 
@@ -291,7 +294,7 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
             for event in matching_events
         )
         assert all(
-            event["name"].startswith(f"{descriptor.event_name}#")
+            event["name"].startswith(f"{event_name}#")
             and event["name"].rsplit("#", 1)[1].isdecimal()
             for event in matching_events
         )
@@ -308,7 +311,7 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
     source_line = inspect.getsourcelines(_ProfilerMLP.forward)[1] + 1
     source_handles = [
         candidate
-        for _, handles in captures
+        for _, _, handles in captures
         for handle in handles
         for candidate in lineage(handle)
         if candidate.source is not None
@@ -331,7 +334,7 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
         f"resolved lineage: {resolved_lineage}"
     )
     assert any(
-        len(handle.fused_from) >= 2 for _, handles in captures for handle in handles
+        len(handle.fused_from) >= 2 for _, _, handles in captures for handle in handles
     ), "the compiled kernel did not retain its fused provenance constituents"
 
     # TODO(PyTorch 2.12): additionally assert that each matching event carries

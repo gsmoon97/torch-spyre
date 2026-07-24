@@ -1,0 +1,369 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Device-free tests for kernel provenance identity and event transport."""
+
+import ctypes
+import dataclasses
+from unittest.mock import patch
+
+import pytest
+
+import torch  # noqa: F401
+from sympy import Integer, Symbol
+
+from torch_spyre._C import DataFormats
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    LoopSpec,
+    OpSpec,
+    SourceLoc,
+    TensorArg,
+)
+from torch_spyre._inductor.kernel_provenance import (
+    build_kernel_provenance_descriptor,
+    KernelProvenanceDescriptor,
+)
+from torch_spyre._inductor.profiler_event import (
+    AIUPTI_ACTIVITY_NAME_MAX_BYTES,
+    extract_kernel_provenance_key,
+    format_kernel_provenance_event_name,
+)
+from torch_spyre.execution.async_compile import SpyreAsyncCompile
+from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+
+
+def _handle(
+    handle_id: int,
+    *,
+    aten_op: str | None = "aten.mm.default",
+    source: SourceLoc | None = SourceLoc("/workspace/model.py", 117),
+    fused_from: tuple[DebugHandle, ...] = (),
+) -> DebugHandle:
+    return DebugHandle(
+        id=handle_id,
+        source=source,
+        aten_op=aten_op,
+        ir_chain=(f"op{handle_id}",),
+        fused_from=fused_from,
+    )
+
+
+def _op(
+    handle: DebugHandle | None,
+    *,
+    op: str = "identity",
+    iteration_space=None,
+    args=(),
+    op_info=None,
+) -> OpSpec:
+    return OpSpec(
+        op=op,
+        is_reduction=False,
+        iteration_space={} if iteration_space is None else iteration_space,
+        args=list(args),
+        op_info={} if op_info is None else op_info,
+        debug_handle=handle,
+    )
+
+
+def _event_name(
+    descriptor: KernelProvenanceDescriptor,
+) -> str:
+    return format_kernel_provenance_event_name(descriptor)
+
+
+class TestKernelProvenanceDescriptor:
+    def test_returns_none_without_handles(self):
+        specs = [
+            _op(None),
+            LoopSpec(count=Integer(2), body=[_op(None)]),
+        ]
+
+        assert build_kernel_provenance_descriptor(specs) is None
+
+    def test_collects_nested_handles_in_order_and_deduplicates_ids(self):
+        first = _handle(9)
+        second = _handle(12, aten_op="aten.add.Tensor")
+        specs = [
+            _op(first),
+            LoopSpec(
+                count=Integer(4),
+                body=[
+                    _op(second),
+                    LoopSpec(count=Integer(2), body=[_op(first)]),
+                ],
+            ),
+        ]
+
+        descriptor = build_kernel_provenance_descriptor(specs)
+
+        assert descriptor is not None
+        assert descriptor.debug_handle_ids == ("9", "12")
+        assert descriptor.aten_ops == ("aten.add.Tensor", "aten.mm.default")
+        assert extract_kernel_provenance_key(_event_name(descriptor)) == descriptor.key
+        assert not hasattr(descriptor, "fusion_context")
+
+    def test_is_deterministic_and_order_sensitive(self):
+        first = _handle(9)
+        second = _handle(12)
+
+        forward = build_kernel_provenance_descriptor([_op(first), _op(second)])
+        repeated = build_kernel_provenance_descriptor([_op(first), _op(second)])
+        reverse = build_kernel_provenance_descriptor([_op(second), _op(first)])
+
+        assert forward is not None
+        assert repeated == forward
+        assert forward.key == "mewuhw4xzgyx4v6sktvdo7jcmhl75fzu35bhulfw4odk2zqs4eqq"
+        assert reverse is not None
+        assert reverse.key != forward.key
+        assert len(forward.key) == 52
+        assert set(forward.key) <= set("abcdefghijklmnopqrstuvwxyz234567")
+
+    def test_distinguishes_structures_with_the_same_handle_set(self):
+        handle = _handle(9)
+        flat = build_kernel_provenance_descriptor([_op(handle)])
+        different_op = build_kernel_provenance_descriptor([_op(handle, op="add")])
+        looped = build_kernel_provenance_descriptor(
+            [LoopSpec(count=Integer(2), body=[_op(handle)])]
+        )
+        repeated_op = build_kernel_provenance_descriptor([_op(handle), _op(handle)])
+
+        descriptors = (flat, different_op, looped, repeated_op)
+        assert all(descriptor is not None for descriptor in descriptors)
+        assert len({descriptor.key for descriptor in descriptors if descriptor}) == 4
+        assert all(
+            descriptor.debug_handle_ids == ("9",)
+            for descriptor in descriptors
+            if descriptor
+        )
+
+    def test_canonicalizes_real_tensor_args_and_unordered_metadata(self):
+        handle = _handle(9)
+        c0 = Symbol("c0")
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0},
+            name="arg0",
+        )
+        first = _op(
+            handle,
+            iteration_space={c0: (Integer(128), 1)},
+            args=(arg,),
+            op_info={"constants": {"alpha": 1.0, "beta": Integer(2)}},
+        )
+        reordered_metadata = _op(
+            handle,
+            iteration_space={c0: (Integer(128), 1)},
+            args=(arg,),
+            op_info={"constants": {"beta": Integer(2), "alpha": 1.0}},
+        )
+        changed_shape = dataclasses.replace(
+            first,
+            args=[dataclasses.replace(arg, device_size=[4, 64])],
+        )
+
+        first_descriptor = build_kernel_provenance_descriptor([first])
+        reordered_descriptor = build_kernel_provenance_descriptor([reordered_metadata])
+        changed_descriptor = build_kernel_provenance_descriptor([changed_shape])
+
+        assert first_descriptor is not None
+        assert reordered_descriptor is not None
+        assert changed_descriptor is not None
+        assert reordered_descriptor.key == first_descriptor.key
+        assert changed_descriptor.key != first_descriptor.key
+
+    def test_descriptor_is_frozen(self):
+        descriptor = build_kernel_provenance_descriptor([_op(_handle(1))])
+
+        assert descriptor is not None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            descriptor.key = "a" * 52  # type: ignore[misc]
+
+
+class TestKernelProvenanceEventName:
+    def test_uses_aten_only_display_without_source_location(self):
+        handle = _handle(
+            42,
+            source=SourceLoc("/private/workspace/model.py", 117),
+        )
+
+        descriptor = build_kernel_provenance_descriptor([_op(handle), _op(handle)])
+
+        assert descriptor is not None
+        assert _event_name(descriptor) == f"spyre_kernel_v2_fused_mm_{descriptor.key}"
+        assert "model" not in _event_name(descriptor)
+        assert "117" not in _event_name(descriptor)
+
+    def test_summarizes_conflicting_handles_without_choosing_a_primary(self):
+        specs = [
+            _op(_handle(1, source=SourceLoc("first.py", 10))),
+            _op(
+                _handle(
+                    2,
+                    aten_op="aten.add.Tensor",
+                    source=SourceLoc("second.py", 20),
+                )
+            ),
+        ]
+
+        descriptor = build_kernel_provenance_descriptor(specs)
+
+        assert descriptor is not None
+        assert _event_name(descriptor) == (
+            f"spyre_kernel_v2_fused_add_mm_{descriptor.key}"
+        )
+
+    def test_uses_recursive_fused_constituents_for_display_only(self):
+        constituent = _handle(1, source=SourceLoc("first.py", 10))
+        fused = _handle(
+            2,
+            aten_op=None,
+            source=None,
+            fused_from=(constituent,),
+        )
+
+        descriptor = build_kernel_provenance_descriptor([_op(fused)])
+
+        assert descriptor is not None
+        assert descriptor.debug_handle_ids == ("2",)
+        assert descriptor.aten_ops == ("aten.mm.default",)
+        assert _event_name(descriptor) == f"spyre_kernel_v2_fused_mm_{descriptor.key}"
+
+    def test_uses_unknown_label_when_no_aten_name_exists(self):
+        descriptor = build_kernel_provenance_descriptor(
+            [_op(_handle(1, aten_op=None, source=None))]
+        )
+
+        assert descriptor is not None
+        assert _event_name(descriptor) == (
+            f"spyre_kernel_v2_fused_unknown_{descriptor.key}"
+        )
+
+    def test_sanitizes_and_bounds_name_with_step_suffix_reservation(self):
+        long_component = "α/" + "very-long-name." * 20
+        handle = _handle(
+            7,
+            aten_op=f"aten.{long_component}.default",
+            source=SourceLoc(f"/tmp/{long_component}.py", 123456),
+        )
+
+        descriptor = build_kernel_provenance_descriptor([_op(handle)])
+
+        assert descriptor is not None
+        assert _event_name(descriptor).isascii()
+        # PR #2930 uses size_t for this JobPlan command index. Match the local
+        # extension ABI instead of assuming that every target uses 64-bit size_t.
+        size_t_bits = ctypes.sizeof(ctypes.c_size_t) * 8
+        largest_step_suffix = f"#{(1 << size_t_bits) - 1}"
+        final_name = f"{_event_name(descriptor)}{largest_step_suffix}"
+        assert len(final_name.encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
+        assert descriptor.key in final_name
+
+    def test_rejects_unrelated_malformed_or_other_version_names(self):
+        key = "a" * 52
+        assert extract_kernel_provenance_key("sdsc_mm_0") is None
+        assert extract_kernel_provenance_key(f"spyre_kernel_fused_mm_{key}") is None
+        assert extract_kernel_provenance_key(f"spyre_kernel_v1_fused_mm_{key}") is None
+        assert extract_kernel_provenance_key("spyre_kernel_v2_fused_mm_short") is None
+        assert extract_kernel_provenance_key(f"xspyre_kernel_v2_fused_mm_{key}") is None
+
+
+class TestKernelProvenancePropagation:
+    def test_async_compile_builds_descriptor_from_finalized_specs(self):
+        specs = [
+            _op(_handle(9)),
+            LoopSpec(count=Integer(2), body=[_op(_handle(12))]),
+        ]
+        runner = object()
+
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ) as runner_type,
+        ):
+            result = SpyreAsyncCompile().sdsc("sdsc_fused_mm_0", specs)
+
+        assert result is runner
+        descriptor = runner_type.call_args.kwargs["kernel_provenance"]
+        assert descriptor.debug_handle_ids == ("9", "12")
+        assert extract_kernel_provenance_key(_event_name(descriptor)) == descriptor.key
+
+    def test_async_compile_keeps_execution_on_unknown_bundle_value(self):
+        specs = [_op(_handle(9), op_info={"future_value": object()})]
+        runner = object()
+
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ) as runner_type,
+            patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+        ):
+            result = SpyreAsyncCompile().sdsc("sdsc_fused_mm_0", specs)
+
+        assert result is runner
+        assert runner_type.call_args.kwargs["kernel_provenance"] is None
+        warning.assert_called_once()
+        assert "continuing without kernel provenance" in warning.call_args.args[0]
+
+    def test_runner_retains_descriptor_for_runtime_forwarding(self):
+        descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
+        assert descriptor is not None
+
+        with patch(
+            "torch_spyre.execution.kernel_runner.prepare_kernel",
+            return_value="jobplan",
+        ) as prepare_kernel:
+            runner = SpyreSDSCKernelRunner(
+                "sdsc_fused_mm_0",
+                "/tmp/kernel",
+                kernel_provenance=descriptor,
+            )
+
+        assert runner.kernel_provenance is descriptor
+        assert runner.profiler_event_name == _event_name(descriptor)
+        assert runner.jobplan == "jobplan"
+        prepare_kernel.assert_called_once_with(
+            "/tmp/kernel/spyreCodeDir",
+            profiler_name=_event_name(descriptor),
+        )
+
+    def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
+        with patch(
+            "torch_spyre.execution.kernel_runner.prepare_kernel",
+            return_value="jobplan",
+        ) as prepare_kernel:
+            runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
+
+        assert runner.kernel_provenance is None
+        assert runner.profiler_event_name is None
+        prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")

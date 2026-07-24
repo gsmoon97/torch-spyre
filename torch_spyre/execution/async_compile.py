@@ -28,7 +28,7 @@ from torch_spyre._inductor.op_spec import (
     UnimplementedOp,
     find_unimplemented,
 )
-from torch_spyre._inductor.profiler_provenance import (
+from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
@@ -84,11 +84,23 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs)
 
-        # This is the common fresh-compile/cache-reload boundary: generated
-        # wrappers have reconstructed the finalized OpSpecs before calling
-        # sdsc(). Derive the version-neutral identity here so PyTorch 2.11 and
-        # 2.12 use the same descriptor without changing the wrapper call ABI.
-        profiler_provenance = build_kernel_provenance_descriptor(specs)
+        try:
+            # This is the common fresh-compile/cache-reload boundary: generated
+            # wrappers have reconstructed the finalized OpSpecs before calling
+            # sdsc(). Derive the version-neutral identity here so PyTorch 2.11 and
+            # 2.12 use the same descriptor without changing the wrapper call ABI.
+            kernel_provenance = build_kernel_provenance_descriptor(specs)
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            # Keep canonicalization strict rather than issuing an ambiguous
+            # fallback key. An unfamiliar future schema value disables only the
+            # profiler join and remains visible in logs.
+            logger.warning(
+                "kernel provenance descriptor construction failed for kernel "
+                "%s; continuing without kernel provenance",
+                kernel_name,
+                exc_info=True,
+            )
+            kernel_provenance = None
 
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
@@ -107,7 +119,7 @@ class SpyreAsyncCompile(AsyncCompile):
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
-            profiler_provenance=profiler_provenance,
+            kernel_provenance=kernel_provenance,
         )
 
     def ktir(
