@@ -222,6 +222,20 @@ class TestDecomposeProvenance:
             "decomposition", "split_multi_ops"
         )
 
+    def test_preserves_complete_history(self):
+        old = _Buf(origins={"parent"}, origin_node="parent")
+        history = tuple(
+            ProvenanceTransform("rewrite", f"pass_{index}") for index in range(100)
+        )
+        setattr(old, _SPYRE_PROV_HISTORY_ATTR, history)
+        child = _Buf()
+
+        decompose_provenance(old, [child], pass_name="split_multi_ops")
+
+        recorded = getattr(child, _SPYRE_PROV_HISTORY_ATTR)
+        assert recorded[:-1] == history
+        assert recorded[-1] == ProvenanceTransform("decomposition", "split_multi_ops")
+
 
 class _FakeGraphLowering:
     """Minimal lowering surface exercised by _make_intermediate_bufs."""
@@ -421,6 +435,30 @@ class TestObserverDetection:
         with SpyreGraphTransformObserver(target, "drops_history", kind="node"):
             setattr(b, _SPYRE_PROV_HISTORY_ATTR, ())
         assert any("transformation history" in r.getMessage() for r in prov_logs)
+
+    def test_intentional_remap_exemption_is_silent(self, prov_logs, monkeypatch):
+        import torch_spyre._inductor.provenance as provenance
+
+        pass_name = "intentional_remap"
+        monkeypatch.setattr(
+            provenance,
+            "INTENTIONAL_PROVENANCE_REMAP_PASSES",
+            frozenset({pass_name}),
+        )
+        b = _Buf(origins={"old"}, origin_node="old")
+        setattr(
+            b,
+            _SPYRE_PROV_HISTORY_ATTR,
+            (ProvenanceTransform("rewrite", "old_pass"),),
+        )
+        target = _NodeListTarget([_unit(b)])
+
+        with SpyreGraphTransformObserver(target, pass_name, kind="node"):
+            b.origins = {"new"}
+            b.origin_node = "new"
+            setattr(b, _SPYRE_PROV_HISTORY_ATTR, ())
+
+        assert not any(pass_name in record.getMessage() for record in prov_logs)
 
     def test_sourceless_creation_pass_origin_node_loss_warns(self, prov_logs):
         # Source-less helper creation does not excuse provenance loss on an

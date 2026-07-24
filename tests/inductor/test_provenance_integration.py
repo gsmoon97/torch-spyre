@@ -179,3 +179,41 @@ def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
         assert prov_logger.level == logging.ERROR
     finally:
         prov_logger.setLevel(previous_level)
+
+
+def test_split_multi_ops_records_history_during_real_compile(monkeypatch):
+    import torch_spyre  # noqa: F401
+
+    from torch_spyre.constants import DEVICE_NAME
+    import torch_spyre._inductor.provenance as prov
+    import torch_spyre._inductor.split_multi_ops as split
+
+    collected = []
+    _orig_decompose = split.decompose_provenance
+    _orig_build = prov.build_debug_handle
+
+    # Wrap the production writer, then inspect its exact child carriers before
+    # later passes may eliminate compiler-generated intermediates.
+
+    def _decompose(old, news, *args, **kwargs):
+        _orig_decompose(old, news, *args, **kwargs)
+        collected.extend(_orig_build(child) for child in news)
+
+    monkeypatch.setattr(split, "decompose_provenance", _decompose)
+    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    torch._dynamo.reset()
+
+    def split_pointwise(x):
+        return torch.relu(x + 1.0)
+
+    x = torch.randn((4, 8, 128), dtype=torch.float16, device=DEVICE_NAME)
+    with torch.no_grad():
+        torch.compile(split_pointwise, backend="inductor")(x)
+
+    assert collected, "split_multi_ops produced no child handles"
+    assert any(
+        transform.kind == "decomposition" and transform.pass_name == "split_multi_ops"
+        for handle in collected
+        if handle is not None
+        for transform in handle.transform_history
+    ), "split_multi_ops did not record decomposition on a child handle"

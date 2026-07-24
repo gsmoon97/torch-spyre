@@ -205,6 +205,10 @@ def _combined_transform_history(
     *carriers: Any,
 ) -> tuple[ProvenanceTransform, ...]:
     """Combine histories in source order, coalescing shared prefixes."""
+    # Prefix merging is O(n*m), but histories are normally 1-3 records, so the
+    # cost is negligible in practice. Keep them unbounded because silent
+    # truncation would make incomplete lineage look authoritative; revisit this
+    # decision if history sizes ever make the merge cost measurable.
     combined: list[ProvenanceTransform] = []
     for carrier in carriers:
         history = _transform_history_of(carrier)
@@ -348,7 +352,9 @@ INTENTIONAL_PROVENANCE_REMAP_PASSES: frozenset[str] = frozenset()
 
 # Warn at most once per pass name per compile to avoid log spam. Reset by the
 # Spyre pass pipelines at the start of each run via reset_provenance_warnings().
-_warned_passes: set = set()
+# Pass pipelines currently run serially, so this module-level mutable set does
+# not require synchronization; revisit if concurrent pass execution is added.
+_warned_passes: set[str] = set()
 
 
 def reset_provenance_warnings() -> None:
