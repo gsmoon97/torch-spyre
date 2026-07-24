@@ -1,0 +1,99 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""AIUPTI/Kineto event-name transport for Spyre kernel provenance.
+
+Upstream Inductor kernel names are backend-qualified and place a descriptive
+fused-op component before a hash or unique suffix. Torch-spyre follows that
+convention while reserving space for the JobPlan #<step> suffix. Libaiupti
+stores AIUpti_ActivityCompute.name in char[128] and reserves one byte for the
+terminating NUL.
+"""
+
+from __future__ import annotations
+
+import ctypes
+
+import regex
+
+from torch_spyre._inductor.kernel_provenance import (
+    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+    KERNEL_PROVENANCE_KEY_VERSION,
+    KernelProvenanceDescriptor,
+)
+
+
+_AIUPTI_ACTIVITY_NAME_BUFFER_BYTES = 128
+AIUPTI_ACTIVITY_NAME_MAX_BYTES = _AIUPTI_ACTIVITY_NAME_BUFFER_BYTES - 1
+
+# PR #2930 represents the JobPlan command position as C++ size_t and its
+# fallback spells the disambiguator as #<step_idx>. Python and the extension
+# share one process ABI, so derive the maximum suffix width.
+_SIZE_T_BITS = ctypes.sizeof(ctypes.c_size_t) * 8
+_MAX_COMPUTE_STEP_SUFFIX_BYTES = len(f"#{(1 << _SIZE_T_BITS) - 1}")
+_MAX_EVENT_NAME_BASE_BYTES = (
+    AIUPTI_ACTIVITY_NAME_MAX_BYTES - _MAX_COMPUTE_STEP_SUFFIX_BYTES
+)
+
+_EVENT_NAME_PREFIX = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_"
+_EVENT_KEY_RE = regex.compile(
+    rf"\A{regex.escape(_EVENT_NAME_PREFIX)}"
+    rf"[A-Za-z0-9_]+_"
+    rf"(?P<key>[a-z2-7]{{{KERNEL_PROVENANCE_KEY_BASE32_WIDTH}}})"
+    rf"(?:#[0-9]+)?\Z"
+)
+_DISPLAY_COMPONENT_RE = regex.compile(r"[^A-Za-z0-9]+")
+
+
+def format_kernel_provenance_event_name(
+    descriptor: KernelProvenanceDescriptor,
+) -> str:
+    """Encode a bounded, human-readable event name for a kernel descriptor."""
+    display = _aten_summary(descriptor.aten_ops)
+    key_suffix = f"_{descriptor.key}"
+    display_budget = _MAX_EVENT_NAME_BASE_BYTES - len(
+        f"{_EVENT_NAME_PREFIX}{key_suffix}".encode("ascii")
+    )
+    display = display[:display_budget].rstrip("_")
+    return f"{_EVENT_NAME_PREFIX}{display}{key_suffix}"
+
+
+def extract_kernel_provenance_key(event_name: str) -> str | None:
+    """Extract a kernel-provenance key from a Spyre device event name."""
+    match = _EVENT_KEY_RE.match(event_name)
+    return match.group("key") if match is not None else None
+
+
+def _aten_summary(aten_ops: tuple[str, ...]) -> str:
+    """Return an upstream-style, display-only fused ATen packet summary."""
+    names = sorted({_aten_packet_name(aten_op) for aten_op in aten_ops})
+    return "_".join(["fused", *(names or ["unknown"])])
+
+
+def _aten_packet_name(aten_op: str) -> str:
+    parts = aten_op.split(".")
+    packet = parts[1] if len(parts) >= 2 and parts[0] == "aten" else aten_op
+    return _sanitize_component(packet)
+
+
+def _sanitize_component(value: str) -> str:
+    sanitized = _DISPLAY_COMPONENT_RE.sub("_", value).strip("_")
+    return sanitized or "unknown"
+
+
+# TODO(PyTorch 2.12): register key -> debug_handle_ids with the out-of-tree
+# PrivateUse1 activity profiler and emit directly attached IDs as Kineto metadata.
+# The kernel descriptor and event-name contract are shared by PyTorch 2.11 and
+# 2.12; structured metadata is additive, and the name remains the compatibility
+# join.
