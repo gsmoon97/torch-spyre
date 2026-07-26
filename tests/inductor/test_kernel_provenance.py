@@ -21,7 +21,8 @@ from unittest.mock import patch
 import pytest
 
 import torch  # noqa: F401
-from sympy import Integer, Symbol
+from sympy import Integer, Symbol, sympify
+from torch._inductor.utils import IndentedBuffer
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import (
@@ -40,6 +41,7 @@ from torch_spyre._inductor.profiler_event import (
     extract_kernel_provenance_key,
     format_kernel_provenance_event_name,
 )
+from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 
@@ -82,6 +84,29 @@ def _event_name(
     descriptor: KernelProvenanceDescriptor,
 ) -> str:
     return format_kernel_provenance_event_name(descriptor)
+
+
+def _generated_wrapper_roundtrip(specs):
+    """Serialize and reconstruct specs through the generated-wrapper seam."""
+
+    def sympy_str(value):
+        return f"sympify({str(value)!r})"
+
+    buf = IndentedBuffer()
+    buf.writeline("[")
+    with buf.indent():
+        _codegen_op_spec_list(specs, buf, sympy_str)
+    buf.writeline("]")
+    namespace = {
+        "DataFormats": DataFormats,
+        "DebugHandle": DebugHandle,
+        "LoopSpec": LoopSpec,
+        "OpSpec": OpSpec,
+        "SourceLoc": SourceLoc,
+        "TensorArg": TensorArg,
+        "sympify": sympify,
+    }
+    return eval(buf.getvalue(), namespace)  # noqa: S307
 
 
 class TestKernelProvenanceDescriptor:
@@ -187,6 +212,42 @@ class TestKernelProvenanceDescriptor:
         assert changed_descriptor is not None
         assert reordered_descriptor.key == first_descriptor.key
         assert changed_descriptor.key != first_descriptor.key
+
+    def test_generated_wrapper_roundtrip_reproduces_descriptor(self):
+        constituent = _handle(8, aten_op="aten.permute.default")
+        handle = _handle(9, fused_from=(constituent,))
+        c0 = Symbol("c0")
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0},
+            name="arg0",
+        )
+        specs = [
+            LoopSpec(
+                count=Integer(2),
+                body=[
+                    _op(
+                        handle,
+                        op="add",
+                        iteration_space={c0: (Integer(128), 1)},
+                        args=(arg,),
+                        op_info={"constants": {"alpha": 1.0}},
+                    )
+                ],
+            )
+        ]
+
+        original = build_kernel_provenance_descriptor(specs)
+        reconstructed = build_kernel_provenance_descriptor(
+            _generated_wrapper_roundtrip(specs)
+        )
+
+        assert original is not None
+        assert reconstructed == original
 
     def test_descriptor_is_frozen(self):
         descriptor = build_kernel_provenance_descriptor([_op(_handle(1))])
