@@ -377,6 +377,11 @@ class TestFfdcAsyncCompile:
             UnimplementedOp=object,
             find_unimplemented=lambda specs: None,
         )
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.kernel_provenance",
+            build_kernel_provenance_descriptor=lambda specs: None,
+        )
         codegen = _stub_module(monkeypatch, "torch_spyre._inductor.codegen")
         codegen.__path__ = []
         _stub_module(
@@ -393,9 +398,10 @@ class TestFfdcAsyncCompile:
             )
 
         class _Runner:
-            def __init__(self, name, code_dir):
+            def __init__(self, name, code_dir, kernel_provenance=None):
                 self.kernel_name = name
                 self.code_dir = code_dir
+                self.kernel_provenance = kernel_provenance
 
         _stub_module(
             monkeypatch,
@@ -495,6 +501,18 @@ class TestFfdcKernelRunner:
                 monkeypatch,
                 "torch_spyre._inductor.logging_utils",
                 get_inductor_logger=lambda name: logging.getLogger(name),
+            )
+        if "torch_spyre._inductor.kernel_provenance" not in sys.modules:
+            _stub_module(
+                monkeypatch,
+                "torch_spyre._inductor.kernel_provenance",
+                KernelProvenanceDescriptor=object,
+            )
+        if "torch_spyre._inductor.profiler_event" not in sys.modules:
+            _stub_module(
+                monkeypatch,
+                "torch_spyre._inductor.profiler_event",
+                format_kernel_provenance_event_name=lambda descriptor: "event_name",
             )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.kernel_runner")
