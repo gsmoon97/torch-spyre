@@ -349,6 +349,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
   // The step index disambiguates multi-compute plans.
   std::string name;
+  // A compiler provenance name deliberately overrides any backend-emitted
+  // label: every compute step needs the same stable bundle join key. Without a
+  // provenance name, preserve the existing backend and directory fallbacks.
   if (profiler_name_.has_value() && !profiler_name_->empty()) {
     name = *profiler_name_ + "#" + std::to_string(step_idx);
   } else if (cmd.contains("name") && cmd["name"].is_string()) {

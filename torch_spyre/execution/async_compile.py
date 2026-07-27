@@ -87,8 +87,8 @@ class SpyreAsyncCompile(AsyncCompile):
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
-            # sdsc(). Derive the version-neutral identity here so PyTorch 2.11 and
-            # 2.12 use the same descriptor without changing the wrapper call ABI.
+            # sdsc(). Derive the transport-neutral identity here so PyTorch 2.11
+            # and 2.12 share a descriptor without changing the wrapper call ABI.
             kernel_provenance = build_kernel_provenance_descriptor(specs)
         except Exception:  # noqa: BLE001 - provenance must never fail the build
             # Keep canonicalization strict rather than issuing an ambiguous
