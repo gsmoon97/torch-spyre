@@ -218,8 +218,11 @@ def test_synchronize_callable():
 
 
 @pytest.mark.requires_spyre_profiler
-def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
-    """A real device-kernel event resolves to compiler DebugHandles."""
+def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
+    """Real event keys match compiler handles captured in the same process.
+
+    Phase 3b will persist this out-of-band mapping as the provenance sidecar.
+    """
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor.profiler_event import (
         AIUPTI_ACTIVITY_NAME_MAX_BYTES,
@@ -316,7 +319,7 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
         for candidate in lineage(handle)
         if candidate.source is not None
     ]
-    resolved_lineage = [
+    captured_lineage = [
         (
             handle.source.file,
             handle.source.start_line,
@@ -327,11 +330,11 @@ def test_compiled_kernel_events_resolve_to_debug_handles(monkeypatch):
     assert any(
         handle.source.file.endswith("test_spyre_profiler.py")
         and handle.source.start_line == source_line
-        and handle.aten_op == "aten.addmm.default"
+        and handle.aten_op == "aten.linear.default"
         for handle in source_handles
     ), (
-        "the profiler key did not resolve to the model's linear source line; "
-        f"resolved lineage: {resolved_lineage}"
+        "the captured provenance did not contain the model's linear source line; "
+        f"captured lineage: {captured_lineage}"
     )
     assert any(
         len(handle.fused_from) >= 2 for _, _, handles in captures for handle in handles

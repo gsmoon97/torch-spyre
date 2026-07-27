@@ -34,13 +34,38 @@ import sympy
 from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, TensorArg
 
 
-# Version 1 (the committed handle-set key) could map structurally different
-# OpSpec bundles to one value. Version 2 fingerprints the finalized bundle so a
-# key has one structural meaning. Any canonicalization change must bump this
-# version so persisted sidecars and profiler events are never reinterpreted.
+# Version 1 defines the first public finalized-bundle fingerprint. Any
+# canonicalization change must bump this version so persisted sidecars and
+# profiler events are never reinterpreted.
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
-KERNEL_PROVENANCE_KEY_VERSION = 2
+KERNEL_PROVENANCE_KEY_VERSION = 1
 KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 52
+
+_EXPECTED_OP_SPEC_FIELDS = frozenset(
+    {
+        "op",
+        "is_reduction",
+        "iteration_space",
+        "args",
+        "op_info",
+        "tiled_symbols",
+        "symbolic_dim_bounds",
+        "debug_handle",
+    }
+)
+_EXPECTED_TENSOR_ARG_FIELDS = frozenset(
+    {
+        "is_input",
+        "arg_index",
+        "device_dtype",
+        "device_size",
+        "device_coordinates",
+        "allocation",
+        "per_tile_fixed",
+        "name",
+    }
+)
+_EXPECTED_LOOP_SPEC_FIELDS = frozenset({"count", "body"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,7 +75,10 @@ class KernelProvenanceDescriptor:
     ``key`` fingerprints the finalized OpSpec tree, including each OpSpec's
     directly attached DebugHandle ID. ``debug_handle_ids`` is the ordered,
     deduplicated set exposed to profiler consumers; recursive ``fused_from``
-    lineage remains in the handle records. ``aten_ops`` contains sorted,
+    lineage remains in the handle records. Because handle IDs derive from
+    source metadata and IR names, key stability is scoped to equivalent
+    recompiles in the same source/toolchain context, not source relocation.
+    ``aten_ops`` contains sorted,
     deduplicated ATen names for human-readable consumers; it is not identity.
     """
 
@@ -61,17 +89,16 @@ class KernelProvenanceDescriptor:
 
 def build_kernel_provenance_descriptor(
     specs: Sequence[object],
-) -> KernelProvenanceDescriptor | None:
+) -> KernelProvenanceDescriptor:
     """Build the provenance identity for a finalized OpSpec tree.
 
     Nested ``LoopSpec`` bodies are traversed depth-first. Repeated IDs are
     deduplicated without sorting so the descriptor retains deterministic
-    compiler emission order. Returns ``None`` when no OpSpec has provenance.
+    compiler emission order. A valid bundle always has an identity, even when
+    no OpSpec carries a DebugHandle.
     """
+    _validate_finalized_schema()
     handles = _deduplicate_handles(_iter_debug_handles(specs))
-    if not handles:
-        return None
-
     handle_ids = tuple(str(handle.id) for handle in handles)
     key = _kernel_bundle_key(specs)
     return KernelProvenanceDescriptor(
@@ -135,6 +162,25 @@ def _kernel_bundle_key(specs: Sequence[object]) -> str:
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("ascii")).digest()
     return base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+
+
+def _validate_finalized_schema() -> None:
+    """Reject schema drift that the canonical bundle payload would omit."""
+    schemas = (
+        (OpSpec, _EXPECTED_OP_SPEC_FIELDS),
+        (TensorArg, _EXPECTED_TENSOR_ARG_FIELDS),
+        (LoopSpec, _EXPECTED_LOOP_SPEC_FIELDS),
+    )
+    for schema, expected_fields in schemas:
+        actual_fields = frozenset(field.name for field in dataclasses.fields(schema))
+        if actual_fields == expected_fields:
+            continue
+        added = sorted(actual_fields - expected_fields)
+        removed = sorted(expected_fields - actual_fields)
+        raise TypeError(
+            f"{schema.__name__} schema changed; update kernel provenance "
+            f"canonicalization (added={added}, removed={removed})"
+        )
 
 
 def _canonical_spec(spec: object) -> object:

@@ -46,20 +46,27 @@ _MAX_EVENT_NAME_BASE_BYTES = (
     AIUPTI_ACTIVITY_NAME_MAX_BYTES - _MAX_COMPUTE_STEP_SUFFIX_BYTES
 )
 
+_SUPPORTED_KEY_WIDTHS = {1: KERNEL_PROVENANCE_KEY_BASE32_WIDTH}
 _EVENT_NAME_PREFIX = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_"
 _EVENT_KEY_RE = regex.compile(
-    rf"\A{regex.escape(_EVENT_NAME_PREFIX)}"
-    rf"[A-Za-z0-9_]+_"
-    rf"(?P<key>[a-z2-7]{{{KERNEL_PROVENANCE_KEY_BASE32_WIDTH}}})"
-    rf"(?:#[0-9]+)?\Z"
+    r"\Aspyre_kernel_v(?P<version>[0-9]+)_"
+    r"[A-Za-z0-9_]+?_"
+    r"(?P<key>[a-z2-7]+)"
+    r"(?:#[0-9]+)?\Z"
 )
 _DISPLAY_COMPONENT_RE = regex.compile(r"[^A-Za-z0-9]+")
+_BASE32_KEY_RE = regex.compile(r"\A[a-z2-7]+\Z")
 
 
 def format_kernel_provenance_event_name(
     descriptor: KernelProvenanceDescriptor,
 ) -> str:
     """Encode a bounded, human-readable event name for a kernel descriptor."""
+    if (
+        len(descriptor.key) != KERNEL_PROVENANCE_KEY_BASE32_WIDTH
+        or _BASE32_KEY_RE.match(descriptor.key) is None
+    ):
+        raise ValueError("kernel provenance key is not canonical lowercase base32")
     display = _aten_summary(descriptor.aten_ops)
     key_suffix = f"_{descriptor.key}"
     display_budget = _MAX_EVENT_NAME_BASE_BYTES - len(
@@ -72,7 +79,12 @@ def format_kernel_provenance_event_name(
 def extract_kernel_provenance_key(event_name: str) -> str | None:
     """Extract a kernel-provenance key from a Spyre device event name."""
     match = _EVENT_KEY_RE.match(event_name)
-    return match.group("key") if match is not None else None
+    if match is None:
+        return None
+    version = int(match.group("version"))
+    expected_width = _SUPPORTED_KEY_WIDTHS.get(version)
+    key = match.group("key")
+    return key if expected_width is not None and len(key) == expected_width else None
 
 
 def _aten_summary(aten_ops: tuple[str, ...]) -> str:

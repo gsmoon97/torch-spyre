@@ -72,6 +72,45 @@ prof.export_chrome_trace("spyre_trace.json")
 
 See [Trace analysis](trace_analysis.md) for viewing.
 
+### Compiled-kernel provenance names
+
+Compiled Spyre compute events use a versioned name that carries a stable
+bundle identity:
+
+```text
+spyre_kernel_v1_<fused-aten-summary>_<52-character-key>#<step>
+```
+
+The key is the complete lowercase base32 encoding of a SHA-256 fingerprint
+over the finalized `OpSpec` and `LoopSpec` bundle. Torch-Spyre shortens the
+display-only ATen summary before the key, never the key itself, to fit the
+AIUPTI event-name limit. Source paths and line numbers are not written in
+plaintext, avoiding disclosure of private paths. The fingerprint does include
+direct `debug_handle` IDs, which derive from source metadata; moving the same
+model to a different path can therefore change the opaque key.
+
+The name describes bundle-level attribution:
+
+- Every `ComputeOnDevice` step produced from the bundle receives the same key.
+  The `#<step>` suffix distinguishes commands; it does not claim that the
+  proprietary backend assigned a particular subset of operations to that step.
+- A compiler-generated provenance name deliberately replaces an existing
+  SpyreCode compute label so every compute event retains the stable join key.
+  Plans without a provenance name keep their previous labels and fallbacks.
+- The associated descriptor lists only `debug_handle` IDs attached directly
+  to finalized `OpSpec` records. Recursive `fused_from` records provide the
+  constituent source and ATen lineage; the readable summary may use those
+  constituents without adding their IDs to the direct list.
+- A valid bundle with no handles still receives a key and uses
+  `fused_unknown` as its display summary.
+
+Phase 3a places only the join key in the trace. The trace alone cannot map that
+key back to handles or source. Phase 3b will persist that mapping in the
+`spyre_provenance.json` sidecar; consumers must pair the trace with that
+artifact for durable source attribution. Native Kineto
+`args.debug_handles` metadata is planned as an additive PyTorch 2.12 path, with
+the v1 name retained for compatibility.
+
 ## Advanced features
 
 Full reference lives in the upstream
