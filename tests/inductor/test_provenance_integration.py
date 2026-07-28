@@ -69,8 +69,9 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     """Compile ``model`` on-device and assert the provenance invariants.
 
     Shared by every model parametrization of
-    ``test_handles_survive_real_compile``: (a) no pass dropped provenance, (b)
-    a production reconstruction uses ``preserve_provenance`` when the model
+    ``test_handles_survive_real_compile``: (a) the observer inspected real
+    buffers and no pass dropped provenance, (b) a production reconstruction uses
+    ``preserve_provenance`` when the model
     exercises one, (c) at least one handle resolves to a source line in this test
     module, and (d) a fused handle carries that line among its constituents.
     """
@@ -84,21 +85,34 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     preserved = []
     _orig = prov.build_debug_handle
     _orig_preserve = prov.preserve_provenance
+    _orig_observer_enter = prov.SpyreGraphTransformObserver.__enter__
+    observer_snapshot_sizes = []
 
     def _collect(buffer):
         h = _orig(buffer)
         collected.append(h)
         return h
 
-    def _preserve(old, new):
-        _orig_preserve(old, new)
+    def _preserve(old, new, *args, **kwargs):
+        _orig_preserve(old, new, *args, **kwargs)
         preserved.append((old, new))
+
+    def _observer_enter(observer):
+        result = _orig_observer_enter(observer)
+        if observer._active:
+            observer_snapshot_sizes.append(len(observer._before))
+        return result
 
     # These modules import the helpers by name, so patch each bound reference.
     monkeypatch.setattr(prov, "build_debug_handle", _collect)
     monkeypatch.setattr(sk, "build_debug_handle", _collect)
     monkeypatch.setattr(pass_utils, "preserve_provenance", _preserve)
     monkeypatch.setattr(restickify, "preserve_provenance", _preserve)
+    monkeypatch.setattr(
+        prov.SpyreGraphTransformObserver,
+        "__enter__",
+        _observer_enter,
+    )
 
     # Defeat Inductor's on-disk FX graph cache so codegen (and therefore
     # build_debug_handle) actually runs this process. Same pattern as the
@@ -128,6 +142,9 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
 
     # (a) No pass dropped provenance (observer emitted no drop warnings).
     drops = [r for r in handler.buffer if "spyre-provenance" in r.getMessage()]
+    assert any(observer_snapshot_sizes), (
+        "observer did not snapshot any real provenance-bearing buffers"
+    )
     assert not drops, (
         f"observer reported provenance drops: {[r.getMessage() for r in drops]}"
     )

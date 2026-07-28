@@ -1144,6 +1144,9 @@ def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
     operations: list[Operation],
+    *,
+    pass_name: str,
+    reason: str | None = None,
 ) -> ComputedBuffer:
     """Replace the body (``data``) of a ``ComputedBuffer`` with ``new_data``.
 
@@ -1170,7 +1173,7 @@ def replace_computed_buffer_body(
         _original_reduction_ranges=op._original_reduction_ranges,
     )
     new_buf.operation_name = op.operation_name
-    preserve_provenance(op, new_buf)
+    preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 

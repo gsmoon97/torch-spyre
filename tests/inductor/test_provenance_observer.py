@@ -23,7 +23,9 @@ import pytest
 import torch
 import torch.fx as fx
 from torch._inductor import config as inductor_config
+from torch._inductor.virtualized import V
 
+from torch_spyre._inductor.dedup_constants import _drop_constant
 from torch_spyre._inductor.loop_info import copy_op_metadata
 from torch_spyre._inductor.op_spec import ProvenanceTransform
 from torch_spyre._inductor.provenance import (
@@ -66,6 +68,9 @@ class _Buf:
     def get_name(self):
         return self._name
 
+    def get_operation_name(self):
+        return self._name
+
 
 @dataclasses.dataclass(frozen=True)
 class _FrozenBuf:
@@ -79,7 +84,7 @@ class TestPreserveProvenance:
     def test_copies_origins_and_node(self):
         old = _Buf(origins={"a", "b"}, origin_node="a")
         new = _Buf()
-        preserve_provenance(old, new)
+        preserve_provenance(old, new, pass_name="test_preserve")
         assert new.origins == {"a", "b"}
         assert new.origin_node == "a"
 
@@ -88,14 +93,17 @@ class TestPreserveProvenance:
         history = (ProvenanceTransform("fusion", "fuse"),)
         setattr(old, _SPYRE_PROV_HISTORY_ATTR, history)
         new = _Buf()
-        preserve_provenance(old, new)
-        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == history
+        preserve_provenance(old, new, pass_name="test_preserve")
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == (
+            *history,
+            ProvenanceTransform("rewrite", "test_preserve"),
+        )
 
     def test_does_not_clobber_existing_origin_node(self):
         # A pass that already set origin_node on the new buffer keeps its value.
         old = _Buf(origin_node="a")
         new = _Buf(origin_node="b")
-        preserve_provenance(old, new)
+        preserve_provenance(old, new, pass_name="test_preserve")
         assert new.origin_node == "b"
 
     def test_combines_existing_histories_without_clobbering(self):
@@ -106,11 +114,12 @@ class TestPreserveProvenance:
         setattr(old, _SPYRE_PROV_HISTORY_ATTR, (old_transform,))
         setattr(new, _SPYRE_PROV_HISTORY_ATTR, (new_transform,))
 
-        preserve_provenance(old, new)
+        preserve_provenance(old, new, pass_name="test_preserve")
 
         assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == (
             old_transform,
             new_transform,
+            ProvenanceTransform("rewrite", "test_preserve"),
         )
 
     def test_preserves_legitimate_repeated_records(self):
@@ -120,15 +129,30 @@ class TestPreserveProvenance:
         history = (repeated, repeated)
         setattr(old, _SPYRE_PROV_HISTORY_ATTR, history)
         setattr(new, _SPYRE_PROV_HISTORY_ATTR, history)
-        preserve_provenance(old, new)
-        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == history
+        preserve_provenance(old, new, pass_name="test_preserve")
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR) == (
+            *history,
+            ProvenanceTransform("rewrite", "test_preserve"),
+        )
 
     def test_unions_into_existing_origins(self):
         # origins is unioned in place, not rebound: pre-existing origins survive.
         old = _Buf(origins={"a"})
         new = _Buf(origins={"z"})
-        preserve_provenance(old, new)
+        preserve_provenance(old, new, pass_name="test_preserve")
         assert new.origins == {"a", "z"}
+
+    def test_frozen_carrier_copies_primary_and_records_rewrite(self):
+        old = _Buf(origins={"a"}, origin_node="a")
+        new = _FrozenBuf()
+
+        preserve_provenance(old, new, pass_name="test_preserve")
+
+        assert new.origins == {"a"}
+        assert new.origin_node == "a"
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "rewrite", "test_preserve"
+        )
 
 
 class TestCopyOpMetadata:
@@ -166,6 +190,18 @@ class TestMergeProvenance:
         new = _Buf(origin_node="a")
         merge_provenance([s1, s2], new, pass_name="spyre_fuse_nodes")
         assert new.origin_node is None
+
+    def test_frozen_carrier_clears_primary(self):
+        source = _Buf(origins={"a"}, origin_node="a")
+        new = _FrozenBuf(origin_node="a")
+
+        merge_provenance([source], new, pass_name="test_merge")
+
+        assert new.origins == {"a"}
+        assert new.origin_node is None
+        assert getattr(new, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "fusion", "test_merge"
+        )
 
 
 class TestDecomposeProvenance:
@@ -218,6 +254,18 @@ class TestDecomposeProvenance:
 
         assert child.origins == {"child"}
         assert child.origin_node == "child"
+        assert getattr(child, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
+            "decomposition", "split_multi_ops"
+        )
+
+    def test_frozen_child_inherits_primary_by_default(self):
+        old = _Buf(origins={"parent"}, origin_node="parent")
+        child = _FrozenBuf()
+
+        decompose_provenance(old, [child], pass_name="split_multi_ops")
+
+        assert child.origins == {"parent"}
+        assert child.origin_node == "parent"
         assert getattr(child, _SPYRE_PROV_HISTORY_ATTR)[-1] == ProvenanceTransform(
             "decomposition", "split_multi_ops"
         )
@@ -469,6 +517,75 @@ class TestObserverDetection:
             b.origin_node = None
         assert any("insert_restickify" in r.getMessage() for r in prov_logs)
 
+    def test_graphlowering_new_unattributed_buffer_warns(self, prov_logs):
+        graph = SimpleNamespace(operations=[])
+        pass_name = "creates_bare_graphlowering_buffer"
+
+        with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+            graph.operations.append(_Buf(origins=set(), name="new"))
+
+        assert any(pass_name in record.getMessage() for record in prov_logs)
+
+    def test_removed_buffer_without_forwarding_warns(self, prov_logs):
+        removed = _Buf(origins={"lost"}, origin_node="lost", name="removed")
+        survivor = _Buf(origins={"kept"}, origin_node="kept", name="survivor")
+        graph = SimpleNamespace(operations=[removed, survivor])
+        pass_name = "drops_removed_buffer"
+
+        with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+            graph.operations.remove(removed)
+
+        assert any(
+            pass_name in record.getMessage()
+            and "removed a buffer" in record.getMessage()
+            for record in prov_logs
+        )
+
+    def test_dedup_forwards_removed_constant_provenance(self, prov_logs):
+        canonical = _Buf(origins={"a"}, origin_node="a", name="canonical")
+        duplicate = _Buf(origins={"b"}, origin_node="b", name="duplicate")
+        canonical_history = (ProvenanceTransform("rewrite", "canonical_pass"),)
+        duplicate_history = (ProvenanceTransform("rewrite", "duplicate_pass"),)
+        setattr(canonical, _SPYRE_PROV_HISTORY_ATTR, canonical_history)
+        setattr(duplicate, _SPYRE_PROV_HISTORY_ATTR, duplicate_history)
+        graph = SimpleNamespace(
+            operations=[canonical, duplicate],
+            removed_buffers=set(),
+            name_to_buffer={"canonical": canonical, "duplicate": duplicate},
+            name_to_op={"canonical": canonical, "duplicate": duplicate},
+            name_to_users={"canonical": [], "duplicate": []},
+        )
+        pass_name = "dedup_and_promote_constants"
+
+        with V.set_graph_handler(graph):
+            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+                _drop_constant(graph.operations, duplicate, canonical)
+
+        assert graph.operations == [canonical]
+        assert canonical.origins == {"a", "b"}
+        assert canonical.origin_node is None
+        history = getattr(canonical, _SPYRE_PROV_HISTORY_ATTR)
+        assert history[-1] == ProvenanceTransform(
+            "fusion", pass_name, "duplicate constant"
+        )
+        assert duplicate_history[0] in history
+        assert not any(pass_name in record.getMessage() for record in prov_logs)
+
+    def test_deadcode_removal_is_silent(self, prov_logs):
+        dead = _Buf(origins={"dead"}, origin_node="dead", name="dead")
+        graph = SimpleNamespace(operations=[dead])
+
+        with SpyreGraphTransformObserver(
+            graph,
+            "deadcode_elimination",
+            kind="graphlowering",
+        ):
+            graph.operations.remove(dead)
+
+        assert not any(
+            "deadcode_elimination" in record.getMessage() for record in prov_logs
+        )
+
 
 class TestPipelineWrapping:
     def test_node_pipeline_observes_each_pass(self, prov_logs):
@@ -484,6 +601,19 @@ class TestPipelineWrapping:
         pipeline._has_spyre_device = lambda target: True
         pipeline([_unit(_Buf(origins={"a"}))])
         assert any("dropping_node_pass" in r.getMessage() for r in prov_logs)
+
+    def test_node_pipeline_reconciles_returned_list(self, prov_logs):
+        from torch_spyre._inductor.passes import _SpyreNodePassPipeline
+
+        def replacing_node_pass(nodes):
+            assert len(nodes) == 1
+            return [_unit(_Buf(origins={"a"}, name="x"))]
+
+        pipeline = _SpyreNodePassPipeline([replacing_node_pass])
+        pipeline._has_spyre_device = lambda target: True
+        pipeline([_unit(_Buf(origins={"a", "b"}, name="x"))])
+
+        assert any("replacing_node_pass" in record.getMessage() for record in prov_logs)
 
     def test_graphlowering_pipeline_observes_each_pass(self, prov_logs, monkeypatch):
         import torch_spyre._inductor.passes as passes_mod

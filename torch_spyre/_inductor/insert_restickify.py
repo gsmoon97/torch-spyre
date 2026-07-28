@@ -198,7 +198,12 @@ def insert_restickify_on_node_inputs(
         _original_reduction_ranges=op._original_reduction_ranges,
     )
     new_consumer_buffer.operation_name = op.operation_name
-    preserve_provenance(op, new_consumer_buffer)
+    preserve_provenance(
+        op,
+        new_consumer_buffer,
+        pass_name="insert_restickify",
+        reason="redirect consumer to restickified input",
+    )
     copy_op_metadata(op, new_consumer_buffer)
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer

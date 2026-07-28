@@ -644,7 +644,13 @@ def _patch_original_buf(
     # Preserve origins from the original data object (dataclasses.replace creates
     # a fresh object with empty origins; we must restore it).
     object.__setattr__(new_data, "origins", op.data.origins)
-    new_op = replace_computed_buffer_body(op, new_data, operations)
+    new_op = replace_computed_buffer_body(
+        op,
+        new_data,
+        operations,
+        pass_name="split_multi_ops",
+        reason="rewrite original buffer body",
+    )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 

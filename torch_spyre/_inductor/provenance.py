@@ -262,22 +262,30 @@ def _union_origins(src: Any, dst: Any) -> None:
         dst_origins.update(src_origins)
 
 
-def preserve_provenance(old: Any, new: Any) -> None:
-    """1:1 rewrite: carry origins, primary node, and history onto new.
+def preserve_provenance(
+    old: Any,
+    new: Any,
+    pass_name: str,
+    reason: str | None = None,
+) -> None:
+    """1:1 rewrite: carry provenance and append a rewrite record.
 
     Targets Buffer/ComputedBuffer, whose ``origins`` container is mutable.
     ``origins`` is unioned; ``origin_node`` keeps a value deliberately set by
     the pass. Transformation histories are combined in old-then-new order, so
     destination records remain the most recent without discarding the old
-    buffer's lineage.
+    buffer's lineage. ``pass_name`` identifies the pass performing the rewrite.
     """
     _union_origins(old, new)
     node = getattr(old, "origin_node", None)
     if node is not None and getattr(new, "origin_node", None) is None:
-        new.origin_node = node
-    history = _combined_transform_history(old, new)
-    if history:
-        _set_transform_history(new, history)
+        object.__setattr__(new, "origin_node", node)
+    transform = ProvenanceTransform(
+        kind="rewrite",
+        pass_name=pass_name,
+        reason=reason,
+    )
+    _append_transform((old,), new, transform)
 
 
 def merge_provenance(
@@ -294,7 +302,7 @@ def merge_provenance(
     # then derives source and ATen headlines independently from the full set: a
     # field is populated only when there is one distinct non-None value;
     # conflicting values stay None, and fused_from remains authoritative.
-    new.origin_node = None
+    object.__setattr__(new, "origin_node", None)
     transform = ProvenanceTransform(
         kind="fusion",
         pass_name=pass_name,
@@ -328,7 +336,7 @@ def decompose_provenance(
         if inherit_origins:
             _union_origins(old, child)
             if node is not None and getattr(child, "origin_node", None) is None:
-                child.origin_node = node
+                object.__setattr__(child, "origin_node", node)
         _append_transform((old,), child, transform)
 
 
@@ -341,14 +349,22 @@ SOURCELESS_CREATION_PASSES = frozenset(
         "insert_restickify",
         "insert_post_mutation_restickify",
         "insert_bmm_padding",
-        "dedup_and_promote_constants",
     }
 )
+
+# Entries use the observer-visible name from passes._get_pass_name. For a pass
+# hidden behind an @_runs wrapper, this is the wrapper name (for example,
+# ``_maybe_coarse_tile``), not the wrapped function name.
 
 # Passes that intentionally remap provenance on existing buffers. Keep this
 # separate and conservative: add an entry only after verifying that dropping an
 # old origin or origin_node is part of the pass's declared rewrite semantics.
 INTENTIONAL_PROVENANCE_REMAP_PASSES: frozenset[str] = frozenset()
+
+# Passes that intentionally delete pre-existing buffers without forwarding
+# their provenance. Other removals must leave the removed unit's origins and
+# history on at least one surviving carrier.
+INTENTIONAL_PROVENANCE_REMOVAL_PASSES = frozenset({"deadcode_elimination"})
 
 # Warn at most once per pass name per compile to avoid log spam. Reset by the
 # Spyre pass pipelines at the start of each run via reset_provenance_warnings().
@@ -387,7 +403,8 @@ def _iter_prov_units(target: Any, kind: str) -> list:
 
     kind == "graphlowering": target is a GraphLowering; its ``operations`` are
       ir.Operation/ComputedBuffer nodes that carry ``origins``.
-    kind == "node": target is a list[BaseSchedulerNode]; the buffer is ``.node``.
+    kind == "node": target is a list[BaseSchedulerNode]; scheduler wrappers are
+      recursively resolved to their underlying buffers.
     Any other kind (e.g. FX "graph", already observed upstream) yields nothing.
     """
     units: list = []
@@ -396,9 +413,28 @@ def _iter_prov_units(target: Any, kind: str) -> list:
             for op in getattr(target, "operations", []) or []:
                 units.append(op)
         elif kind == "node":
+            visited: set[int] = set()
+
+            def append_scheduler_units(node: Any) -> None:
+                if id(node) in visited:
+                    return
+                visited.add(id(node))
+                buf = getattr(node, "node", None)
+                if buf is not None:
+                    units.append(buf)
+                    return
+                get_nodes = getattr(node, "get_nodes", None)
+                if callable(get_nodes):
+                    nested = list(get_nodes())
+                    if len(nested) != 1 or nested[0] is not node:
+                        for child in nested:
+                            append_scheduler_units(child)
+                        return
+                if hasattr(node, "origins"):
+                    units.append(node)
+
             for n in target or []:
-                buf = getattr(n, "node", None)
-                units.append(buf if buf is not None else n)
+                append_scheduler_units(n)
     except Exception:
         return []
     return [u for u in units if u is not None]
@@ -436,7 +472,7 @@ class SpyreGraphTransformObserver:
     ``trace.provenance_tracking_level >= 1``; handle construction and explicit
     provenance forwarding remain unconditional.
 
-    It does NOT forward provenance or record transformations — that is the job
+    It does NOT forward provenance or record transformations; that is the job
     of the explicit helpers and existing buffer-reconstruction path.
     """
 
@@ -475,7 +511,10 @@ class SpyreGraphTransformObserver:
     def _reconcile(self) -> None:
         creation_exempt = self.pass_name in SOURCELESS_CREATION_PASSES
         remap_exempt = self.pass_name in INTENTIONAL_PROVENANCE_REMAP_PASSES
-        for u in _iter_prov_units(self.target, self.kind):
+        removal_exempt = self.pass_name in INTENTIONAL_PROVENANCE_REMOVAL_PASSES
+        after_units = _iter_prov_units(self.target, self.kind)
+        after_keys = {_unit_key(unit) for unit in after_units}
+        for u in after_units:
             snap = self._before.get(_unit_key(u))
             now = _origins_of(u)
             if snap is not None:
@@ -493,12 +532,21 @@ class SpyreGraphTransformObserver:
                 # origin_node is authoritative for handle source/aten; a pass
                 # that had one and cleared it silently loses attribution.
                 now_node = getattr(u, "origin_node", None)
-                if before_node is not None and now_node is None and not remap_exempt:
+                now_history = _transform_history_of(u)
+                primary_was_merged = before_node in now and any(
+                    transform.kind == "fusion" and transform.pass_name == self.pass_name
+                    for transform in now_history[len(before_history) :]
+                )
+                if (
+                    before_node is not None
+                    and now_node is None
+                    and not primary_was_merged
+                    and not remap_exempt
+                ):
                     self._warn(
                         "dropped origin_node (authoritative provenance) on an "
                         "existing buffer"
                     )
-                now_history = _transform_history_of(u)
                 if (
                     not _history_is_subsequence(before_history, now_history)
                     and not remap_exempt
@@ -511,6 +559,46 @@ class SpyreGraphTransformObserver:
                     "created a buffer without provenance; use "
                     "preserve_/merge_/decompose_provenance"
                 )
+
+        if removal_exempt or remap_exempt:
+            return
+        for key, snap in self._before.items():
+            if key in after_keys:
+                continue
+            before, before_node, before_history = snap
+            if not before and before_node is None and not before_history:
+                continue
+            if any(
+                self._removed_provenance_survives(
+                    before,
+                    before_node,
+                    before_history,
+                    unit,
+                )
+                for unit in after_units
+            ):
+                continue
+            self._warn("removed a buffer without forwarding its provenance")
+
+    @staticmethod
+    def _removed_provenance_survives(
+        before: frozenset,
+        before_node: Any,
+        before_history: tuple[ProvenanceTransform, ...],
+        unit: Any,
+    ) -> bool:
+        """Return whether one survivor carries a removed unit's provenance."""
+        now = _origins_of(unit)
+        if not before.issubset(now):
+            return False
+        if before_node is not None:
+            now_node = getattr(unit, "origin_node", None)
+            if now_node is not before_node and before_node not in now:
+                return False
+        return _history_is_subsequence(
+            before_history,
+            _transform_history_of(unit),
+        )
 
     def _warn(self, msg: str) -> None:
         if self.pass_name in _warned_passes:

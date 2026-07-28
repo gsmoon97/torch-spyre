@@ -106,9 +106,12 @@ it. A buffer with no `origins` gets no handle, while `origins` without a stack
 trace produce a handle with no source line. A pass that creates or rewrites a
 `ComputedBuffer` must preserve or deliberately remap this provenance.
 
-Reuse the existing helpers rather than setting `origins` by hand:
+Use the existing helpers for new rewrite code and when modifying an existing
+rewrite rather than setting `origins` by hand. Some legacy passes still copy
+`origins` directly; this is migration guidance, not a claim that every existing
+site has already been converted.
 
-+ `replace_computed_buffer_body(op, new_data, operations)` in
++ `replace_computed_buffer_body(op, new_data, operations, pass_name=...)` in
   [pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
   when reconstructing a buffer's body. It forwards `operation_name`, provenance,
   and Spyre operation metadata.
@@ -120,8 +123,9 @@ Reuse the existing helpers rather than setting `origins` by hand:
 + `preserve_provenance`, `merge_provenance`, and `decompose_provenance` in
   [provenance.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/provenance.py)
   at explicit rewrite sites:
-  + `preserve_provenance(old, new)` carries origins, the primary node, and
-    existing history through a 1-to-1 reconstruction.
+  + `preserve_provenance(old, new, pass_name, reason=None)` carries origins, the
+    primary node, and existing history through a 1-to-1 reconstruction, then
+    appends a `rewrite` record.
   + `merge_provenance(sources, new, pass_name, reason=None)` unions the source
     origins, clears any stale primary node, and appends a `fusion` record.
   + `decompose_provenance(old, news, pass_name, reason=None)` gives each output
@@ -132,8 +136,9 @@ Reuse the existing helpers rather than setting `origins` by hand:
 Transformation history is an immutable tuple of `ProvenanceTransform` records.
 Each record separates `kind`, `pass_name`, and optional `reason`; do not
 reintroduce a scalar context attribute. `DebugHandle.transform_history` is the
-authoritative serialized form for fusion, decomposition, clone, rewrite, and
-remap steps.
+authoritative serialized form for lower-IR transformation records. The current
+helpers emit `rewrite`, `fusion`, and `decomposition`; the schema also supports
+`clone` and `remap` for passes that explicitly implement those relationships.
 
 When a lower-IR pass creates a fresh semantic FX node, retain the parent source
 lineage while assigning the child's own operation identity. In practice, copy
@@ -143,12 +148,15 @@ origin. Do not union the parent FX node into the child's origins, because that
 would turn a decomposition into an apparent fusion.
 
 `SpyreGraphTransformObserver` wraps every pass in the node and pre-scheduling
-pipelines and emits a warning when a pass drops any of an existing buffer's
-`origins` (even a partial loss, such as a fused buffer going from two sources to
-one), clears its `origin_node`, drops transformation-history records, or creates
-a buffer with no provenance. The observer detects loss but never guesses rewrite
-semantics or repairs provenance. If a warning appears, use an explicit helper at
-the rewrite site.
+pipelines. Node passes are reconciled against the list they return, with fused
+and loop scheduler wrappers recursively resolved to their underlying buffers.
+It emits a warning when a pass drops any of an existing buffer's `origins`
+(even a partial loss, such as a fused buffer going from two sources to one),
+clears its `origin_node`, drops transformation-history records, creates a
+buffer with no provenance, or removes a buffer without forwarding its
+attribution. The observer detects loss but never guesses rewrite semantics or
+repairs provenance. If a warning appears, use an explicit helper at the rewrite
+site.
 
 Some passes legitimately create source-less buffers (for example padding via
 `constant_pad_nd`). Those pass names are listed in
@@ -156,8 +164,9 @@ Some passes legitimately create source-less buffers (for example padding via
 create a new buffer without provenance; the observer still reports provenance
 loss on existing buffers reconstructed by the same pass. A pass that
 intentionally remaps an existing buffer must separately declare that policy in
-`INTENTIONAL_PROVENANCE_REMAP_PASSES`, after confirming the lost origins or
-`origin_node` are intentional.
+`INTENTIONAL_PROVENANCE_REMAP_PASSES`. A pass that intentionally deletes
+buffers without forwarding provenance must be listed separately in
+`INTENTIONAL_PROVENANCE_REMOVAL_PASSES`.
 
 The observer is disabled by default and follows Inductor's
 `trace.provenance_tracking_level`: every positive level, including level 2,

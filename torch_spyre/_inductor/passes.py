@@ -181,14 +181,12 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         reset_provenance_warnings()
         for pass_fn in self.passes:
             name = _get_pass_name(pass_fn)
-            # The observer snapshots the list it is given at __enter__; these
-            # passes regroup SchedulerNodes while the underlying
-            # ComputedBuffers persist, so in-place origin drops are detected.
-            # A pass that returns an entirely new list is simply not
-            # re-examined (no false positive) -- the load-bearing detection
-            # is on the GraphLowering pipeline below.
-            with SpyreGraphTransformObserver(target, name, kind="node"):
+            observer = SpyreGraphTransformObserver(target, name, kind="node")
+            with observer:
                 target = pass_fn(target)
+                # Reconcile the returned list while recursively inspecting the
+                # underlying buffers through scheduler get_nodes().
+                observer.target = target
         return target
 
     def uuid(self) -> Any | None:
