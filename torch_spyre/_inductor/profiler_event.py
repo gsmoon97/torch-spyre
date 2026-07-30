@@ -18,7 +18,8 @@ Upstream Inductor kernel names are backend-qualified and place a descriptive
 fused-op component before a hash or unique suffix. Torch-spyre follows that
 convention while reserving space for the JobPlan #<step> suffix. Libaiupti
 stores AIUpti_ActivityCompute.name in char[128] and reserves one byte for the
-terminating NUL.
+terminating NUL. The source of truth is
+libaiupti/include/libaiupti/aiupti_activity.h.
 """
 
 from __future__ import annotations
@@ -55,25 +56,28 @@ _EVENT_KEY_RE = regex.compile(
     r"(?:#[0-9]+)?\Z"
 )
 _DISPLAY_COMPONENT_RE = regex.compile(r"[^A-Za-z0-9]+")
-_BASE32_KEY_RE = regex.compile(r"\A[a-z2-7]+\Z")
+_MIN_EVENT_NAME_BASE_BYTES = len(
+    f"{_EVENT_NAME_PREFIX}u_{'a' * KERNEL_PROVENANCE_KEY_BASE32_WIDTH}".encode("ascii")
+)
+if _MIN_EVENT_NAME_BASE_BYTES > _MAX_EVENT_NAME_BASE_BYTES:
+    raise RuntimeError("kernel provenance event-name fields exceed AIUPTI limit")
 
 
 def format_kernel_provenance_event_name(
     descriptor: KernelProvenanceDescriptor,
 ) -> str:
     """Encode a bounded, human-readable event name for a kernel descriptor."""
-    if (
-        len(descriptor.key) != KERNEL_PROVENANCE_KEY_BASE32_WIDTH
-        or _BASE32_KEY_RE.match(descriptor.key) is None
-    ):
-        raise ValueError("kernel provenance key is not canonical lowercase base32")
     display = _aten_summary(descriptor.aten_ops)
     key_suffix = f"_{descriptor.key}"
-    display_budget = _MAX_EVENT_NAME_BASE_BYTES - len(
-        f"{_EVENT_NAME_PREFIX}{key_suffix}".encode("ascii")
+    display_budget = max(
+        1,
+        _MAX_EVENT_NAME_BASE_BYTES
+        - len(f"{_EVENT_NAME_PREFIX}{key_suffix}".encode("ascii")),
     )
-    display = display[:display_budget].rstrip("_")
-    return f"{_EVENT_NAME_PREFIX}{display}{key_suffix}"
+    display = display[:display_budget].rstrip("_") or "u"
+    name = f"{_EVENT_NAME_PREFIX}{display}{key_suffix}"
+    assert len(name.encode("ascii")) <= _MAX_EVENT_NAME_BASE_BYTES, name
+    return name
 
 
 def extract_kernel_provenance_key(event_name: str) -> str | None:
@@ -95,7 +99,7 @@ def _aten_summary(aten_ops: tuple[str, ...]) -> str:
 
 def _aten_packet_name(aten_op: str) -> str:
     parts = aten_op.split(".")
-    packet = parts[1] if len(parts) >= 2 and parts[0] == "aten" else aten_op
+    packet = parts[1] if len(parts) >= 3 else aten_op
     return _sanitize_component(packet)
 
 
