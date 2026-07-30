@@ -49,7 +49,9 @@ _EXPECTED_OP_SPEC_FIELDS = frozenset(
         "args",
         "op_info",
         "tiled_symbols",
+        "tiled_symbol_trip_counts",
         "symbolic_dim_bounds",
+        "node_output_ranges",
         "debug_handle",
     }
 )
@@ -63,6 +65,7 @@ _EXPECTED_TENSOR_ARG_FIELDS = frozenset(
         "allocation",
         "per_tile_fixed",
         "name",
+        "device_tile_advance_expr",
     }
 )
 _EXPECTED_LOOP_SPEC_FIELDS = frozenset({"count", "body"})
@@ -204,7 +207,9 @@ def _canonical_spec(spec: object) -> object:
                 [_canonical_value(symbol) for symbol in level]
                 for level in spec.tiled_symbols
             ],
+            "tiled_symbol_trip_counts": _canonical_value(spec.tiled_symbol_trip_counts),
             "symbolic_dim_bounds": _canonical_value(spec.symbolic_dim_bounds),
+            "node_output_ranges": _canonical_value(spec.node_output_ranges),
             # Preserve position and multiplicity in the bundle fingerprint.
             # The descriptor separately deduplicates its consumer-facing list.
             "debug_handle_id": (
@@ -230,6 +235,7 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         "allocation": _canonical_value(arg.allocation),
         "per_tile_fixed": arg.per_tile_fixed,
         "name": arg.name,
+        "device_tile_advance_expr": _canonical_value(arg.device_tile_advance_expr),
     }
 
 

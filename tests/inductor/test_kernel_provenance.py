@@ -28,6 +28,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
+    IndirectAccess,
     LoopSpec,
     OpSpec,
     SourceLoc,
@@ -70,6 +71,10 @@ def _op(
     iteration_space=None,
     args=(),
     op_info=None,
+    tiled_symbols=None,
+    tiled_symbol_trip_counts=None,
+    symbolic_dim_bounds=None,
+    node_output_ranges=None,
 ) -> OpSpec:
     return OpSpec(
         op=op,
@@ -77,6 +82,14 @@ def _op(
         iteration_space={} if iteration_space is None else iteration_space,
         args=list(args),
         op_info={} if op_info is None else op_info,
+        tiled_symbols=[] if tiled_symbols is None else tiled_symbols,
+        tiled_symbol_trip_counts=(
+            {} if tiled_symbol_trip_counts is None else tiled_symbol_trip_counts
+        ),
+        symbolic_dim_bounds=(
+            {} if symbolic_dim_bounds is None else symbolic_dim_bounds
+        ),
+        node_output_ranges=node_output_ranges,
         debug_handle=handle,
     )
 
@@ -91,7 +104,10 @@ def _generated_wrapper_roundtrip(specs):
     """Serialize and reconstruct specs through the generated-wrapper seam."""
 
     def sympy_str(value):
-        return f"sympify({str(value)!r})"
+        if isinstance(value, IndirectAccess):
+            name_sym = value.args[0]
+            return f"IndirectAccess('{name_sym}')"
+        return "sympify('" + str(value) + "')"
 
     buf = IndentedBuffer()
     buf.writeline("[")
@@ -101,6 +117,7 @@ def _generated_wrapper_roundtrip(specs):
     namespace = {
         "DataFormats": DataFormats,
         "DebugHandle": DebugHandle,
+        "IndirectAccess": IndirectAccess,
         "LoopSpec": LoopSpec,
         "OpSpec": OpSpec,
         "SourceLoc": SourceLoc,
@@ -157,7 +174,7 @@ class TestKernelProvenanceDescriptor:
         reverse = build_kernel_provenance_descriptor([_op(second), _op(first)])
 
         assert independently_reconstructed == forward
-        assert forward.key == "cfspzxghk3bsvgh436lfy7l6zna4kvenoti56d5l2rqawxw7wydq"
+        assert forward.key == "vsancadvtjfcq6cvksowyo62lhpzg2dlufhhgalyqebfbtdk4f2q"
         assert reverse.key != forward.key
         assert len(forward.key) == 52
         assert set(forward.key) <= set("abcdefghijklmnopqrstuvwxyz234567")
@@ -219,6 +236,49 @@ class TestKernelProvenanceDescriptor:
         assert reordered_descriptor.key == first_descriptor.key
         assert changed_descriptor.key != first_descriptor.key
 
+    def test_pins_rich_canonical_bundle_key(self):
+        c0 = Symbol("c0")
+        index = Symbol("index")
+        constituent = _handle(8, aten_op="aten.permute.default")
+        handle = _handle(9, fused_from=(constituent,))
+        arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=[2, 64],
+            device_coordinates=[IndirectAccess(index), c0],
+            allocation={"hbm_pool": {"offset": 4096}},
+            per_tile_fixed=True,
+            name="arg0",
+            device_tile_advance_expr=64 * c0,
+        )
+        spec = _op(
+            handle,
+            op="add",
+            iteration_space={c0: (Integer(128), 2)},
+            args=(arg,),
+            op_info={
+                "alpha": 1.5,
+                "mask": b"\x00\xff",
+                "expression": c0 + 1,
+            },
+            tiled_symbols=[[c0]],
+            tiled_symbol_trip_counts={c0: 4},
+            symbolic_dim_bounds={"s0": (128, 64)},
+            node_output_ranges=(Integer(1), Integer(2), c0, Integer(64)),
+        )
+
+        descriptor = build_kernel_provenance_descriptor(
+            [LoopSpec(count=Integer(4), body=[spec])]
+        )
+
+        assert descriptor.debug_handle_ids == ("9",)
+        assert descriptor.aten_ops == (
+            "aten.mm.default",
+            "aten.permute.default",
+        )
+        assert descriptor.key == "atqydvnuutl766naame5ylq7rfc4nmxtdrfutsp2wpm73xmp6jaa"
+
     def test_generated_wrapper_roundtrip_reproduces_descriptor(self):
         constituent = _handle(8, aten_op="aten.permute.default")
         handle = _handle(9, fused_from=(constituent,))
@@ -242,6 +302,10 @@ class TestKernelProvenanceDescriptor:
                         iteration_space={c0: (Integer(128), 1)},
                         args=(arg,),
                         op_info={"constants": {"alpha": 1.0}},
+                        tiled_symbols=[[c0]],
+                        tiled_symbol_trip_counts={c0: 2},
+                        symbolic_dim_bounds={"s0": (128, 64)},
+                        node_output_ranges=(Integer(1), Integer(2), c0),
                     )
                 ],
             )
