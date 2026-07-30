@@ -39,7 +39,6 @@ from torch_spyre._inductor.kernel_provenance import (
     KernelProvenanceDescriptor,
 )
 from torch_spyre._inductor.profiler_event import (
-    AIUPTI_ACTIVITY_NAME_MAX_BYTES,
     extract_kernel_provenance_key,
     format_kernel_provenance_event_name,
 )
@@ -425,7 +424,7 @@ class TestKernelProvenanceEventName:
         size_t_bits = ctypes.sizeof(ctypes.c_size_t) * 8
         largest_step_suffix = f"#{(1 << size_t_bits) - 1}"
         final_name = f"{_event_name(descriptor)}{largest_step_suffix}"
-        assert len(final_name.encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
+        assert len(final_name.encode("ascii")) <= 127
         assert descriptor.key in final_name
 
     @pytest.mark.parametrize(
@@ -438,9 +437,8 @@ class TestKernelProvenanceEventName:
         ],
     )
     def test_rejects_noncanonical_descriptor_key(self, key):
-        descriptor = KernelProvenanceDescriptor(key, (), ())
         with pytest.raises(ValueError, match="not canonical lowercase base32"):
-            _event_name(descriptor)
+            KernelProvenanceDescriptor(key, (), ())
 
     def test_accepts_supported_version_and_rejects_other_names(self):
         key = "a" * 52

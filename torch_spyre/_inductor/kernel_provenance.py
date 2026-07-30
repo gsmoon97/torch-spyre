@@ -40,6 +40,7 @@ from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, TensorA
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
 KERNEL_PROVENANCE_KEY_VERSION = 1
 KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 52
+_KERNEL_PROVENANCE_KEY_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
 _EXPECTED_OP_SPEC_FIELDS = frozenset(
     {
@@ -89,9 +90,16 @@ class KernelProvenanceDescriptor:
     debug_handle_ids: tuple[str, ...]
     aten_ops: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        if (
+            len(self.key) != KERNEL_PROVENANCE_KEY_BASE32_WIDTH
+            or not set(self.key) <= _KERNEL_PROVENANCE_KEY_ALPHABET
+        ):
+            raise ValueError("kernel provenance key is not canonical lowercase base32")
+
 
 def build_kernel_provenance_descriptor(
-    specs: Sequence[object],
+    specs: Sequence[OpSpec | LoopSpec],
 ) -> KernelProvenanceDescriptor:
     """Build the provenance identity for a finalized OpSpec tree.
 
@@ -111,13 +119,19 @@ def build_kernel_provenance_descriptor(
     )
 
 
-def _iter_debug_handles(specs: Sequence[object]) -> Iterator[DebugHandle]:
+def _iter_debug_handles(
+    specs: Sequence[OpSpec | LoopSpec],
+) -> Iterator[DebugHandle]:
     for spec in specs:
         if isinstance(spec, OpSpec):
             if spec.debug_handle is not None:
                 yield spec.debug_handle
         elif isinstance(spec, LoopSpec):
             yield from _iter_debug_handles(spec.body)
+        else:
+            raise TypeError(
+                f"Unsupported finalized kernel spec: {type(spec).__qualname__}"
+            )
 
 
 def _deduplicate_handles(handles: Iterator[DebugHandle]) -> tuple[DebugHandle, ...]:
@@ -149,7 +163,7 @@ def _collect_aten_ops(handles: tuple[DebugHandle, ...]) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
-def _kernel_bundle_key(specs: Sequence[object]) -> str:
+def _kernel_bundle_key(specs: Sequence[OpSpec | LoopSpec]) -> str:
     """Fingerprint the complete finalized OpSpec tree.
 
     The canonical payload contains execution-relevant OpSpec/LoopSpec structure
@@ -168,7 +182,10 @@ def _kernel_bundle_key(specs: Sequence[object]) -> str:
 
 
 def _validate_finalized_schema() -> None:
-    """Reject schema drift that the canonical bundle payload would omit."""
+    """Reject finalized execution-schema drift omitted from the bundle key."""
+    # DebugHandle is intentionally not guarded here. Its content-hashed ``id``
+    # is the only handle field in bundle identity, so provenance metadata can
+    # evolve without changing the finalized execution-schema format.
     schemas = (
         (OpSpec, _EXPECTED_OP_SPEC_FIELDS),
         (TensorArg, _EXPECTED_TENSOR_ARG_FIELDS),
