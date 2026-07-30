@@ -28,15 +28,13 @@ import ctypes
 
 import regex
 
+from torch_spyre._C import AIUPTI_ACTIVITY_NAME_MAX_BYTES
 from torch_spyre._inductor.kernel_provenance import (
     KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
     KERNEL_PROVENANCE_KEY_VERSION,
     KernelProvenanceDescriptor,
 )
 
-
-_AIUPTI_ACTIVITY_NAME_BUFFER_BYTES = 128
-AIUPTI_ACTIVITY_NAME_MAX_BYTES = _AIUPTI_ACTIVITY_NAME_BUFFER_BYTES - 1
 
 # PR #2930 represents the JobPlan command position as C++ size_t and its
 # fallback spells the disambiguator as #<step_idx>. Python and the extension

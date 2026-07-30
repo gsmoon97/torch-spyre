@@ -197,6 +197,8 @@ PYBIND11_MODULE(_C, m) {
   }
 
   m.doc() = "Spyre C++ bindings";
+  m.attr("AIUPTI_ACTIVITY_NAME_MAX_BYTES") =
+      py::int_(spyre::kAIUptiActivityNameMaxBytes);
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);

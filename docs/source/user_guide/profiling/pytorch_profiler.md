@@ -89,6 +89,14 @@ plaintext, avoiding disclosure of private paths. The fingerprint does include
 direct `debug_handle` IDs, which derive from source metadata; moving the same
 model to a different path can therefore change the opaque key.
 
+The readable component intentionally derives from stable ATen packet names
+instead of reusing Inductor's generated `kernel_name`, whose numeric suffix
+depends on compilation order. The formatter conservatively reserves enough
+space for `#<step>` even when the step index is the largest value supported by
+the process ABI. A typical plan uses much smaller indices, but keeping this
+reservation guarantees that Python-generated names remain valid after the C++
+runtime appends the suffix.
+
 The name describes bundle-level attribution:
 
 - Every `ComputeOnDevice` step produced from the bundle receives the same key.
@@ -110,6 +118,10 @@ key back to handles or source. Phase 3b will persist that mapping in the
 artifact for durable source attribution. Native Kineto
 `args.debug_handles` metadata is planned as an additive PyTorch 2.12 path, with
 the v1 name retained for compatibility.
+
+The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
+key or a cross-machine artifact identifier; source-path, schema, or toolchain
+changes can produce a different key.
 
 ## Advanced features
 

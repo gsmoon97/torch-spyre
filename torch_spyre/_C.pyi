@@ -8,6 +8,7 @@ import torch
 import typing
 
 __all__: list[str] = [
+    "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "DataFormats",
     "JobPlan",
     "ElementArrangement",
@@ -41,6 +42,8 @@ __all__: list[str] = [
     "start_runtime",
     "to_with_layout",
 ]
+
+AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
 
 class DataFormats:
     """
