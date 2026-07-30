@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import tempfile
-from typing import cast
+from typing import Any, cast
 from collections.abc import Sequence
 import os
 import subprocess
@@ -59,6 +59,11 @@ class SpyreAsyncCompile(AsyncCompile):
 
     """
 
+    def __init__(self):
+        super().__init__()
+        self._provenance_attempt_count = 0
+        self._provenance_failure_count = 0
+
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
             "SpyreAsyncCompile does not support Triton kernels; only "
@@ -85,6 +90,7 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs)
 
+        self._provenance_attempt_count += 1
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
@@ -94,14 +100,17 @@ class SpyreAsyncCompile(AsyncCompile):
             kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
         except Exception:  # noqa: BLE001 - provenance must never fail the build
             # Keep canonicalization strict rather than issuing an ambiguous
-            # fallback key. An unfamiliar future schema value disables only the
-            # profiler join and remains visible in logs.
-            logger.warning(
-                "kernel provenance descriptor construction failed for kernel "
-                "%s; continuing without kernel provenance",
-                kernel_name,
-                exc_info=True,
-            )
+            # fallback key. Log the first traceback, then report the complete
+            # failure count at the generated wrapper's wait() boundary.
+            self._provenance_failure_count += 1
+            if self._provenance_failure_count == 1:
+                logger.warning(
+                    "kernel provenance descriptor construction failed for kernel "
+                    "%s; continuing without kernel provenance; additional "
+                    "failures in this compilation will be summarized",
+                    kernel_name,
+                    exc_info=True,
+                )
             kernel_provenance = None
 
         # Invoke backend compiler of SDSC Bundle
@@ -123,3 +132,14 @@ class SpyreAsyncCompile(AsyncCompile):
             output_dir,
             kernel_provenance=kernel_provenance,
         )
+
+    def wait(self, scope: dict[str, Any]) -> None:
+        super().wait(scope)
+        if self._provenance_failure_count:
+            logger.warning(
+                "kernel provenance disabled for %d/%d compiled Spyre kernels",
+                self._provenance_failure_count,
+                self._provenance_attempt_count,
+            )
+        self._provenance_attempt_count = 0
+        self._provenance_failure_count = 0

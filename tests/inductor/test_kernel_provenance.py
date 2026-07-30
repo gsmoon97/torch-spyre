@@ -503,6 +503,40 @@ class TestKernelProvenancePropagation:
         warning.assert_called_once()
         assert "continuing without kernel provenance" in warning.call_args.args[0]
 
+    def test_async_compile_aggregates_provenance_failures(self):
+        specs = [_op(_handle(9), op_info={"future_value": object()})]
+        runner = object()
+        compiler = SpyreAsyncCompile()
+
+        with (
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ),
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait") as base_wait,
+            patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+        ):
+            assert compiler.sdsc("sdsc_fused_mm_0", specs) is runner
+            assert compiler.sdsc("sdsc_fused_mm_1", specs) is runner
+            compiler.wait({})
+
+        base_wait.assert_called_once_with({})
+        assert warning.call_count == 2
+        assert warning.call_args_list[0].kwargs["exc_info"] is True
+        assert warning.call_args_list[1].args == (
+            "kernel provenance disabled for %d/%d compiled Spyre kernels",
+            2,
+            2,
+        )
+        assert compiler._provenance_attempt_count == 0
+        assert compiler._provenance_failure_count == 0
+
     def test_runner_retains_descriptor_for_runtime_forwarding(self):
         descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
         assert descriptor is not None

@@ -30,6 +30,9 @@
 
 namespace spyre {
 
+inline constexpr size_t kAIUptiActivityNameMaxBytes =
+    sizeof(flex::aiupti::AIUpti_ActivityCB::name) - 1;
+
 /**
  * @brief Builder class for constructing JobPlan from SpyreCode
  *

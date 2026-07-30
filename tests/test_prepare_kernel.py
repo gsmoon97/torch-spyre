@@ -191,6 +191,40 @@ class TestPrepareKernel:
             assert job_plan.get_step_name(0) == f"{profiler_name}#0"
             assert job_plan.get_step_name(1) == f"{profiler_name}#1"
 
+    def test_profiler_name_accepts_exact_aiupti_limit(self):
+        """The finalized name may fill the AIUPTI buffer through byte 127."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == profiler_name + suffix
+
+    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+        """The C++ boundary checks the name after adding the step suffix."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            with pytest.raises(
+                RuntimeError,
+                match="profiler-visible compute name exceeds AIUPTI limit",
+            ):
+                torch_spyre._C.prepare_kernel(
+                    spyrecode_dir,
+                    profiler_name=profiler_name,
+                )
+
     def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
         """Existing named SpyreCode plans retain their current behavior."""
         with tempfile.TemporaryDirectory() as tmpdir:
