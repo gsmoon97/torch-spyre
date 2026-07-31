@@ -354,6 +354,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   // provenance name, preserve the existing backend and directory fallbacks.
   if (profiler_name_.has_value() && !profiler_name_->empty()) {
     name = *profiler_name_ + "#" + std::to_string(step_idx);
+    TORCH_CHECK(name.size() <= kAIUptiActivityNameMaxBytes,
+                "profiler-visible compute name exceeds AIUPTI limit: ",
+                name.size(), " bytes > ", kAIUptiActivityNameMaxBytes);
   } else if (cmd.contains("name") && cmd["name"].is_string()) {
     name = cmd["name"].get<std::string>();
   } else {
@@ -363,9 +366,6 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
     name = (sdsc / inner / "bundle.mlir").string() + "#" +
            std::to_string(step_idx);
   }
-  TORCH_CHECK(name.size() <= kAIUptiActivityNameMaxBytes,
-              "profiler-visible compute name exceeds AIUPTI limit: ",
-              name.size(), " bytes > ", kAIUptiActivityNameMaxBytes);
 
   // TODO(PyTorch 2.12): retain this name as the raw-trace compatibility join
   // when the registered PrivateUse1 profiler also emits structured

@@ -240,6 +240,38 @@ class TestPrepareKernel:
 
             assert job_plan.get_step_name(0) == "legacy_name"
 
+    def test_overlong_spyrecode_compute_name_remains_backend_controlled(self):
+        """A backend label over the provenance limit must not fail preparation."""
+        backend_name = "b" * (torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": backend_name,
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == backend_name
+
+    def test_overlong_directory_compute_name_fallback_does_not_fail(self):
+        """Graceful provenance fallback must not make preparation fatal."""
+        prefix = "k" * torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert len(expected) > torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+            assert job_plan.get_step_name(0) == expected
+
     def test_directory_compute_name_fallback_is_preserved(self):
         """Older unnamed plans retain the directory-derived fallback."""
         with tempfile.TemporaryDirectory() as tmpdir:
