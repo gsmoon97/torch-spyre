@@ -164,7 +164,7 @@ class TestPrepareKernel:
 
     def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
         """Compiler provenance name identifies every device-compute step."""
-        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 52
+        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
         job_exec_plan = [
             {
                 "command": "ComputeOnDevice",

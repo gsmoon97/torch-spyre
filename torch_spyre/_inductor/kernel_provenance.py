@@ -19,6 +19,11 @@ DebugHandles directly attached to finalized OpSpecs and fingerprints the full
 OpSpec/LoopSpec tree. Profiler event-name encoding lives in ``profiler_event``;
 the provenance sidecar and future structured profiler metadata can therefore
 reuse this identity without depending on AIUPTI/Kineto string constraints.
+
+A content hash, rather than a compile-local counter, keeps cache-replayed wrappers
+joinable to their persisted sidecars. Version 1 uses an 80-bit digest prefix;
+that is sufficient for a compile-scoped kernel population while leaving useful
+event-name space for the human-readable ATen summary.
 """
 
 from __future__ import annotations
@@ -34,42 +39,41 @@ import sympy
 from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, TensorArg
 
 
-# Version 1 defines the first public finalized-bundle fingerprint. Any
-# canonicalization change must bump this version so persisted sidecars and
-# profiler events are never reinterpreted.
+# Version 1 defines the first public finalized-bundle fingerprint as an
+# 80-bit digest prefix. Once published, any canonicalization or width change
+# must bump this version so persisted sidecars are never reinterpreted.
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
 KERNEL_PROVENANCE_KEY_VERSION = 1
-KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 52
+KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 16
 _KERNEL_PROVENANCE_KEY_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
-_EXPECTED_OP_SPEC_FIELDS = frozenset(
-    {
-        "op",
-        "is_reduction",
-        "iteration_space",
-        "args",
-        "op_info",
-        "tiled_symbols",
-        "tiled_symbol_trip_counts",
-        "symbolic_dim_bounds",
-        "node_output_ranges",
-        "debug_handle",
-    }
-)
-_EXPECTED_TENSOR_ARG_FIELDS = frozenset(
-    {
-        "is_input",
-        "arg_index",
-        "device_dtype",
-        "device_size",
-        "device_coordinates",
-        "allocation",
-        "per_tile_fixed",
-        "name",
-        "device_tile_advance_expr",
-    }
-)
-_EXPECTED_LOOP_SPEC_FIELDS = frozenset({"count", "body"})
+_EXPECTED_OP_SPEC_SCHEMA = {
+    "op": "str",
+    "is_reduction": "bool",
+    "iteration_space": "dict[Symbol, tuple[Expr, int]]",
+    "args": "Sequence[TensorArg]",
+    "op_info": "dict[str, Any]",
+    "tiled_symbols": "list[list[Symbol]]",
+    "tiled_symbol_trip_counts": "dict[Symbol, int]",
+    "symbolic_dim_bounds": "dict[str, tuple[int, int]]",
+    "node_output_ranges": "tuple[Expr, ...] | None",
+    "debug_handle": "DebugHandle | None",
+}
+_EXPECTED_TENSOR_ARG_SCHEMA = {
+    "is_input": "bool",
+    "arg_index": "int",
+    "device_dtype": "DataFormats",
+    "device_size": "list[int]",
+    "device_coordinates": "list[Expr]",
+    "allocation": "Any",
+    "per_tile_fixed": "bool",
+    "name": "str | None",
+    "device_tile_advance_expr": "Expr | None",
+}
+_EXPECTED_LOOP_SPEC_SCHEMA = {
+    "count": "Expr",
+    "body": "list[Any]",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,7 +182,8 @@ def _kernel_bundle_key(specs: Sequence[OpSpec | LoopSpec]) -> str:
         "specs": [_canonical_spec(spec) for spec in specs],
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("ascii")).digest()
-    return base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+    encoded = base64.b32encode(digest).decode("ascii").rstrip("=").lower()
+    return encoded[:KERNEL_PROVENANCE_KEY_BASE32_WIDTH]
 
 
 def _validate_finalized_schema() -> None:
@@ -187,19 +192,27 @@ def _validate_finalized_schema() -> None:
     # is the only handle field in bundle identity, so provenance metadata can
     # evolve without changing the finalized execution-schema format.
     schemas = (
-        (OpSpec, _EXPECTED_OP_SPEC_FIELDS),
-        (TensorArg, _EXPECTED_TENSOR_ARG_FIELDS),
-        (LoopSpec, _EXPECTED_LOOP_SPEC_FIELDS),
+        (OpSpec, _EXPECTED_OP_SPEC_SCHEMA),
+        (TensorArg, _EXPECTED_TENSOR_ARG_SCHEMA),
+        (LoopSpec, _EXPECTED_LOOP_SPEC_SCHEMA),
     )
-    for schema, expected_fields in schemas:
-        actual_fields = frozenset(field.name for field in dataclasses.fields(schema))
-        if actual_fields == expected_fields:
-            continue
+    for schema, expected_schema in schemas:
+        actual_schema = {field.name: field.type for field in dataclasses.fields(schema)}
+        actual_fields = set(actual_schema)
+        expected_fields = set(expected_schema)
         added = sorted(actual_fields - expected_fields)
         removed = sorted(expected_fields - actual_fields)
+        changed = sorted(
+            name
+            for name in actual_fields & expected_fields
+            if actual_schema[name] != expected_schema[name]
+        )
+        if not added and not removed and not changed:
+            continue
         raise TypeError(
             f"{schema.__name__} schema changed; update kernel provenance "
-            f"canonicalization (added={added}, removed={removed})"
+            f"canonicalization (added={added}, removed={removed}, "
+            f"changed={changed})"
         )
 
 

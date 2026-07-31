@@ -45,8 +45,13 @@ _MAX_EVENT_NAME_BASE_BYTES = (
     AIUPTI_ACTIVITY_NAME_MAX_BYTES - _MAX_COMPUTE_STEP_SUFFIX_BYTES
 )
 
-_SUPPORTED_KEY_WIDTHS = {1: KERNEL_PROVENANCE_KEY_BASE32_WIDTH}
+_SUPPORTED_KEY_WIDTHS = {
+    KERNEL_PROVENANCE_KEY_VERSION: KERNEL_PROVENANCE_KEY_BASE32_WIDTH
+}
 _EVENT_NAME_PREFIX = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_"
+# The separator before the key is unambiguous because ``_`` is not in the
+# lowercase base32 alphabet. Revisit this parser if a future version changes
+# the alphabet.
 _EVENT_KEY_RE = regex.compile(
     r"\Aspyre_kernel_v(?P<version>[0-9]+)_"
     r"[A-Za-z0-9_]+?_"
