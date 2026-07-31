@@ -14,12 +14,20 @@
 
 """Device-free tests for kernel provenance identity and event transport."""
 
+import copy
 import ctypes
 import dataclasses
+import hashlib
+from importlib.resources import files
+import json
+from pathlib import Path
 import types
 from unittest.mock import patch
 
+from jsonschema import ValidationError
+from jsonschema.validators import validator_for
 import pytest
+import regex as re
 
 import torch  # noqa: F401
 from sympy import Integer, Symbol, sympify
@@ -663,3 +671,313 @@ class TestKernelProvenancePropagation:
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
         register_kernel_provenance.assert_not_called()
+
+
+_SCHEMA = json.loads(
+    files("torch_spyre._inductor.schemas")
+    .joinpath("spyre_provenance_v1.schema.json")
+    .read_text(encoding="utf-8")
+)
+_SCHEMA_VALIDATOR_TYPE = validator_for(_SCHEMA)
+_SCHEMA_VALIDATOR_TYPE.check_schema(_SCHEMA)
+_SCHEMA_VALIDATOR = _SCHEMA_VALIDATOR_TYPE(_SCHEMA)
+_PROVENANCE_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "provenance"
+
+
+def _load_provenance_fixture(name: str) -> dict:
+    return json.loads((_PROVENANCE_FIXTURE_DIR / name).read_text(encoding="utf-8"))
+
+
+def _canonical_digest(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _fixture_compile_id(projection: dict) -> str:
+    kernels = [
+        [kernel["compilerKernelName"], kernel["identityKey"]]
+        for kernel in projection["kernels"]
+    ]
+    return _canonical_digest(
+        {
+            "domain": "torch-spyre-compile-v1",
+            "kernels": kernels,
+        }
+    )
+
+
+def _fixture_occurrence_id(occurrence: dict) -> str:
+    return _canonical_digest(
+        {
+            "domain": "torch-spyre-occurrence-v1",
+            "compileId": occurrence["compileId"],
+            "compilerKernelName": occurrence["compilerKernelName"],
+            "identityKey": occurrence["identityKey"],
+        }
+    )
+
+
+def _recursive_fixture_atens(handle_ids: list[str], handles: dict) -> list[str]:
+    names: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(handle_id: str) -> None:
+        assert handle_id in handles
+        if handle_id in visited:
+            return
+        visited.add(handle_id)
+        handle = handles[handle_id]
+        if handle["aten_op"] is not None:
+            names.add(handle["aten_op"])
+        for constituent_id in handle["fused_from"]:
+            visit(constituent_id)
+
+    for handle_id in handle_ids:
+        visit(handle_id)
+    return sorted(names)
+
+
+def _deduplicate_in_order(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def _assert_sorted_keys(mapping: dict) -> None:
+    assert list(mapping) == sorted(mapping)
+
+
+def _validate_fixture_semantics(document: dict) -> None:
+    handles = document["handles"]
+    identities = document["kernelIdentities"]
+    occurrences = document["kernelOccurrences"]
+    projections = document["upstreamProjections"]
+
+    for mapping in (
+        document["diagnostics"],
+        handles,
+        identities,
+        occurrences,
+        projections,
+    ):
+        _assert_sorted_keys(mapping)
+
+    for handle_id, handle in handles.items():
+        assert handle["id"] == handle_id
+        assert all(child_id in handles for child_id in handle["fused_from"])
+
+    for identity_key, identity in identities.items():
+        binding_ids = [
+            binding["handleId"] for binding in identity["specHandleBindings"]
+        ]
+        assert all(handle_id in handles for handle_id in binding_ids)
+        assert identity["directHandleIds"] == _deduplicate_in_order(binding_ids)
+        assert identity["atenOps"] == _recursive_fixture_atens(
+            identity["directHandleIds"], handles
+        )
+        descriptor = KernelProvenanceDescriptor(
+            key=identity_key,
+            debug_handle_ids=tuple(identity["directHandleIds"]),
+            aten_ops=tuple(identity["atenOps"]),
+        )
+        assert (
+            format_kernel_provenance_event_name(descriptor) == identity["eventNameBase"]
+        )
+
+    occurrences_by_compile: dict[str, list[tuple[str, dict]]] = {}
+    for occurrence_id, occurrence in occurrences.items():
+        assert occurrence_id == _fixture_occurrence_id(occurrence)
+        assert occurrence["identityKey"] in identities
+        assert occurrence["compileId"] in projections
+        ordinals = [
+            registration["ordinal"] for registration in occurrence["registrations"]
+        ]
+        assert ordinals == sorted(ordinals)
+        assert len(ordinals) == len(set(ordinals))
+        for registration in occurrence["registrations"]:
+            assert registration["alias"] == (
+                f"{occurrence['compilerKernelName']}:{registration['ordinal']}"
+            )
+        occurrences_by_compile.setdefault(occurrence["compileId"], []).append(
+            (occurrence_id, occurrence)
+        )
+
+    for compile_id, projection in projections.items():
+        assert compile_id == _fixture_compile_id(projection)
+        kernels = [
+            (kernel["compilerKernelName"], kernel["identityKey"])
+            for kernel in projection["kernels"]
+        ]
+        assert len(kernels) == len(set(kernels))
+        assert all(identity_key in identities for _, identity_key in kernels)
+
+        compile_occurrences = occurrences_by_compile.get(compile_id, [])
+        occurrence_kernels = {
+            (
+                occurrence["compilerKernelName"],
+                occurrence["identityKey"],
+            )
+            for _, occurrence in compile_occurrences
+        }
+        assert occurrence_kernels == set(kernels)
+
+        registrations = [
+            registration
+            for _, occurrence in compile_occurrences
+            for registration in occurrence["registrations"]
+        ]
+        ordinals = [registration["ordinal"] for registration in registrations]
+        assert len(ordinals) == len(set(ordinals))
+        registration_aliases = {registration["alias"] for registration in registrations}
+
+        for relation_name in (
+            "preToPost",
+            "postToPre",
+            "cppCodeToPost",
+            "postToCppCode",
+            "kernelStackTraces",
+        ):
+            _assert_sorted_keys(projection[relation_name])
+
+        cpp_to_post = projection["cppCodeToPost"]
+        assert set(cpp_to_post) <= registration_aliases
+        if projection["upstreamJoin"] == "ok":
+            assert set(cpp_to_post) == registration_aliases
+            assert set(projection["kernelStackTraces"]) == registration_aliases
+
+        expected_post_to_cpp: dict[str, list[str]] = {}
+        for alias in sorted(cpp_to_post):
+            for post_node in cpp_to_post[alias]:
+                expected_post_to_cpp.setdefault(post_node, []).append(alias)
+        assert projection["postToCppCode"] == expected_post_to_cpp
+
+        expected_post_to_pre: dict[str, list[str]] = {}
+        for pre_node, post_nodes in projection["preToPost"].items():
+            for post_node in post_nodes:
+                expected_post_to_pre.setdefault(post_node, []).append(pre_node)
+        assert projection["postToPre"] == expected_post_to_pre
+
+    assert set(occurrences_by_compile) == set(projections)
+    expected_status = (
+        "complete"
+        if not document["diagnostics"]
+        and all(
+            projection["upstreamJoin"] == "ok" for projection in projections.values()
+        )
+        else "partial"
+    )
+    assert document["status"] == expected_status
+
+
+def _apply_fixture_mutation(document: dict, mutation: dict) -> dict:
+    mutated = copy.deepcopy(document)
+    tokens = [
+        token.replace("~1", "/").replace("~0", "~")
+        for token in mutation["path"].lstrip("/").split("/")
+    ]
+    parent: object = mutated
+    for token in tokens[:-1]:
+        parent = parent[int(token)] if isinstance(parent, list) else parent[token]
+    final = tokens[-1]
+    if isinstance(parent, list):
+        parent[int(final)] = mutation["value"]
+    else:
+        assert isinstance(parent, dict)
+        parent[final] = mutation["value"]
+    return mutated
+
+
+def _fixture_reader_diagnostic(document: dict) -> str | None:
+    if document.get("schemaVersion") != _SCHEMA["properties"]["schemaVersion"]["const"]:
+        return "unsupported-schema-version"
+    try:
+        _SCHEMA_VALIDATOR.validate(document)
+    except ValidationError:
+        return "schema-validation-failure"
+    try:
+        _validate_fixture_semantics(document)
+    except AssertionError:
+        return "semantic-validation-failure"
+    return None
+
+
+class TestProvenanceArtifactSchema:
+    def test_valid_fixtures_pass_schema_and_semantic_validation(self):
+        manifest = _load_provenance_fixture("fixture_manifest.json")
+
+        for fixture in manifest["valid"]:
+            document = _load_provenance_fixture(fixture["path"])
+            _SCHEMA_VALIDATOR.validate(document)
+            _validate_fixture_semantics(document)
+            assert _fixture_reader_diagnostic(document) is None
+
+    def test_invalid_fixture_mutations_report_declared_reader_diagnostic(self):
+        manifest = _load_provenance_fixture("fixture_manifest.json")
+
+        for fixture in manifest["invalid"]:
+            document = _load_provenance_fixture(fixture["base"])
+            mutated = _apply_fixture_mutation(document, fixture["mutation"])
+            assert (
+                _fixture_reader_diagnostic(mutated)
+                == fixture["expectedReaderDiagnostic"]
+            ), fixture["name"]
+
+    def test_schema_event_contract_matches_production_codec(self):
+        event_key_schema = _SCHEMA["properties"]["eventKey"]["$ref"]
+        assert event_key_schema == "#/$defs/eventKey"
+        assert (
+            _SCHEMA["$defs"]["eventKey"]["properties"]["version"]["const"]
+            == KERNEL_PROVENANCE_KEY_VERSION
+        )
+        assert (
+            _SCHEMA["$defs"]["eventKey"]["properties"]["width"]["const"]
+            == KERNEL_PROVENANCE_KEY_BASE32_WIDTH
+        )
+        assert _SCHEMA["$defs"]["eventKeyValue"]["pattern"] == (
+            rf"^[a-z2-7]{{{KERNEL_PROVENANCE_KEY_BASE32_WIDTH}}}$"
+        )
+
+        document = _load_provenance_fixture("valid_v1.json")
+        event_pattern = _SCHEMA["$defs"]["kernelIdentity"]["properties"][
+            "eventNameBase"
+        ]["pattern"]
+        assert all(
+            re.fullmatch(event_pattern, identity["eventNameBase"])
+            for identity in document["kernelIdentities"].values()
+        )
+
+    def test_cache_replay_reuses_compile_and_occurrence_ids(self):
+        fresh = _load_provenance_fixture("valid_v1.json")
+        cached = _load_provenance_fixture("valid_cache_replay_v1.json")
+        compile_id = "3acd1120e2323fa1fec28f1ff89a59da68cda82541b0a19815ec47a2c922ac0e"
+
+        assert compile_id in fresh["upstreamProjections"]
+        assert compile_id in cached["upstreamProjections"]
+        cached_occurrence_ids = set(cached["kernelOccurrences"])
+        assert cached_occurrence_ids <= set(fresh["kernelOccurrences"])
+        for occurrence_id in cached_occurrence_ids:
+            cached_occurrence = cached["kernelOccurrences"][occurrence_id]
+            fresh_occurrence = fresh["kernelOccurrences"][occurrence_id]
+            assert cached_occurrence["compileId"] == fresh_occurrence["compileId"]
+            assert cached_occurrence["identityKey"] == fresh_occurrence["identityKey"]
+            assert (
+                cached_occurrence["compilerKernelName"]
+                == (fresh_occurrence["compilerKernelName"])
+            )
+            assert cached_occurrence["registrations"] == []
+
+        assert fresh["upstreamProjections"][compile_id]["upstreamJoin"] == "ok"
+        assert cached["upstreamProjections"][compile_id]["upstreamJoin"] == (
+            "unavailable-cache-replay"
+        )
+
+    def test_reserved_occurrence_selector_is_an_opaque_exact_match_token(self):
+        document = _load_provenance_fixture("valid_cache_replay_v1.json")
+        occurrence = next(iter(document["kernelOccurrences"].values()))
+        occurrence["selector"] = "future-event-occurrence-token"
+        _SCHEMA_VALIDATOR.validate(document)
+        _validate_fixture_semantics(document)
