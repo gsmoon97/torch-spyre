@@ -37,6 +37,8 @@ from torch_spyre._inductor.op_spec import (
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
     KernelProvenanceDescriptor,
+    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+    KERNEL_PROVENANCE_KEY_VERSION,
 )
 from torch_spyre._inductor.profiler_event import (
     extract_kernel_provenance_key,
@@ -138,7 +140,7 @@ class TestKernelProvenanceDescriptor:
         assert descriptor.debug_handle_ids == ()
         assert descriptor.aten_ops == ()
         assert _event_name(descriptor) == (
-            f"spyre_kernel_v1_fused_unknown_{descriptor.key}"
+            f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_unknown_{descriptor.key}"
         )
 
     def test_collects_nested_handles_in_order_and_deduplicates_ids(self):
@@ -173,9 +175,9 @@ class TestKernelProvenanceDescriptor:
         reverse = build_kernel_provenance_descriptor([_op(second), _op(first)])
 
         assert independently_reconstructed == forward
-        assert forward.key == "vsancadvtjfcq6cvksowyo62lhpzg2dlufhhgalyqebfbtdk4f2q"
+        assert forward.key == "vsancadvtjfcq6cv"
         assert reverse.key != forward.key
-        assert len(forward.key) == 52
+        assert len(forward.key) == KERNEL_PROVENANCE_KEY_BASE32_WIDTH
         assert set(forward.key) <= set("abcdefghijklmnopqrstuvwxyz234567")
 
     def test_distinguishes_structures_with_the_same_handle_set(self):
@@ -276,7 +278,7 @@ class TestKernelProvenanceDescriptor:
             "aten.mm.default",
             "aten.permute.default",
         )
-        assert descriptor.key == "atqydvnuutl766naame5ylq7rfc4nmxtdrfutsp2wpm73xmp6jaa"
+        assert descriptor.key == "atqydvnuutl766na"
 
     def test_generated_wrapper_roundtrip_reproduces_descriptor(self):
         constituent = _handle(8, aten_op="aten.permute.default")
@@ -325,7 +327,10 @@ class TestKernelProvenanceDescriptor:
         def fields_with_future_field(schema):
             fields = real_fields(schema)
             if schema is changed_schema:
-                return (*fields, types.SimpleNamespace(name="future_field"))
+                return (
+                    *fields,
+                    types.SimpleNamespace(name="future_field", type="object"),
+                )
             return fields
 
         with (
@@ -340,12 +345,47 @@ class TestKernelProvenanceDescriptor:
         ):
             build_kernel_provenance_descriptor([_op(_handle(1))])
 
+    @pytest.mark.parametrize(
+        ("changed_schema", "field_name"),
+        [
+            (OpSpec, "iteration_space"),
+            (TensorArg, "device_coordinates"),
+            (LoopSpec, "body"),
+        ],
+    )
+    def test_rejects_finalized_schema_type_drift(self, changed_schema, field_name):
+        real_fields = dataclasses.fields
+
+        def fields_with_changed_type(schema):
+            fields = real_fields(schema)
+            if schema is not changed_schema:
+                return fields
+            return tuple(
+                types.SimpleNamespace(
+                    name=field.name,
+                    type="future_type" if field.name == field_name else field.type,
+                )
+                for field in fields
+            )
+
+        with (
+            patch(
+                "torch_spyre._inductor.kernel_provenance.dataclasses.fields",
+                side_effect=fields_with_changed_type,
+            ),
+            pytest.raises(
+                TypeError,
+                match=rf"{changed_schema.__name__} schema changed.*{field_name}",
+            ),
+        ):
+            build_kernel_provenance_descriptor([_op(_handle(1))])
+
     def test_descriptor_is_frozen(self):
         descriptor = build_kernel_provenance_descriptor([_op(_handle(1))])
 
         assert descriptor is not None
         with pytest.raises(dataclasses.FrozenInstanceError):
-            descriptor.key = "a" * 52  # type: ignore[misc]
+            descriptor.key = "a" * KERNEL_PROVENANCE_KEY_BASE32_WIDTH  # type: ignore[misc]
 
 
 class TestKernelProvenanceEventName:
@@ -358,7 +398,10 @@ class TestKernelProvenanceEventName:
         descriptor = build_kernel_provenance_descriptor([_op(handle), _op(handle)])
 
         assert descriptor is not None
-        assert _event_name(descriptor) == f"spyre_kernel_v1_fused_mm_{descriptor.key}"
+        assert (
+            _event_name(descriptor)
+            == f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{descriptor.key}"
+        )
         assert "model" not in _event_name(descriptor)
         assert "117" not in _event_name(descriptor)
 
@@ -378,7 +421,7 @@ class TestKernelProvenanceEventName:
 
         assert descriptor is not None
         assert _event_name(descriptor) == (
-            f"spyre_kernel_v1_fused_add_mm_{descriptor.key}"
+            f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_add_mm_{descriptor.key}"
         )
 
     def test_uses_recursive_fused_constituents_for_display_only(self):
@@ -395,7 +438,10 @@ class TestKernelProvenanceEventName:
         assert descriptor is not None
         assert descriptor.debug_handle_ids == ("2",)
         assert descriptor.aten_ops == ("aten.mm.default",)
-        assert _event_name(descriptor) == f"spyre_kernel_v1_fused_mm_{descriptor.key}"
+        assert (
+            _event_name(descriptor)
+            == f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{descriptor.key}"
+        )
 
     def test_uses_unknown_label_when_no_aten_name_exists(self):
         descriptor = build_kernel_provenance_descriptor(
@@ -404,7 +450,7 @@ class TestKernelProvenanceEventName:
 
         assert descriptor is not None
         assert _event_name(descriptor) == (
-            f"spyre_kernel_v1_fused_unknown_{descriptor.key}"
+            f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_unknown_{descriptor.key}"
         )
 
     def test_sanitizes_and_bounds_name_with_step_suffix_reservation(self):
@@ -430,10 +476,10 @@ class TestKernelProvenanceEventName:
     @pytest.mark.parametrize(
         "key",
         [
-            "a" * 51,
-            "a" * 53,
-            "A" * 52,
-            "1" * 52,
+            "a" * (KERNEL_PROVENANCE_KEY_BASE32_WIDTH - 1),
+            "a" * (KERNEL_PROVENANCE_KEY_BASE32_WIDTH + 1),
+            "A" * KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+            "1" * KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
         ],
     )
     def test_rejects_noncanonical_descriptor_key(self, key):
@@ -441,15 +487,24 @@ class TestKernelProvenanceEventName:
             KernelProvenanceDescriptor(key, (), ())
 
     def test_accepts_supported_version_and_rejects_other_names(self):
-        key = "a" * 52
-        assert (
-            extract_kernel_provenance_key(f"spyre_kernel_v1_fused_mm_{key}#17") == key
-        )
+        key = "a" * KERNEL_PROVENANCE_KEY_BASE32_WIDTH
+        valid_name = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{key}#17"
+        assert extract_kernel_provenance_key(valid_name) == key
         assert extract_kernel_provenance_key("sdsc_mm_0") is None
         assert extract_kernel_provenance_key(f"spyre_kernel_fused_mm_{key}") is None
         assert extract_kernel_provenance_key(f"spyre_kernel_v2_fused_mm_{key}") is None
-        assert extract_kernel_provenance_key("spyre_kernel_v1_fused_mm_short") is None
-        assert extract_kernel_provenance_key(f"xspyre_kernel_v1_fused_mm_{key}") is None
+        assert (
+            extract_kernel_provenance_key(
+                f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_short"
+            )
+            is None
+        )
+        assert (
+            extract_kernel_provenance_key(
+                f"xspyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{key}"
+            )
+            is None
+        )
 
 
 class TestKernelProvenancePropagation:

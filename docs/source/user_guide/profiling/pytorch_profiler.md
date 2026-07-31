@@ -78,13 +78,14 @@ Compiled Spyre compute events use a versioned name that carries a stable
 bundle identity:
 
 ```text
-spyre_kernel_v1_<fused-aten-summary>_<52-character-key>#<step>
+spyre_kernel_v1_<fused-aten-summary>_<16-character-key>#<step>
 ```
 
-The key is the complete lowercase base32 encoding of a SHA-256 fingerprint
-over the finalized `OpSpec` and `LoopSpec` bundle. Torch-Spyre shortens the
-display-only ATen summary before the key, never the key itself, to fit the
-AIUPTI event-name limit. Source paths and line numbers are not written in
+The key is the first 80 bits of a SHA-256 fingerprint over the finalized
+`OpSpec` and `LoopSpec` bundle, encoded as 16 lowercase base32 characters. An
+80-bit key keeps collision probability negligible for the kernels in one
+compile while leaving more of the AIUPTI event-name budget for the display-only
+ATen summary. Source paths and line numbers are not written in
 plaintext, avoiding disclosure of private paths. The fingerprint does include
 direct `debug_handle` IDs, which derive from source metadata; moving the same
 model to a different path can therefore change the opaque key.
@@ -100,7 +101,8 @@ runtime appends the suffix.
 The name describes bundle-level attribution:
 
 - Every `ComputeOnDevice` step produced from the bundle receives the same key.
-  The `#<step>` suffix distinguishes commands; it does not claim that the
+  The `#<step>` suffix is the JobExecPlan command index, so compute suffixes
+  need not be contiguous. It distinguishes commands but does not claim that the
   proprietary backend assigned a particular subset of operations to that step.
 - A compiler-generated provenance name deliberately replaces an existing
   SpyreCode compute label so every compute event retains the stable join key.
@@ -121,7 +123,10 @@ the v1 name retained for compatibility.
 
 The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
 key or a cross-machine artifact identifier; source-path, schema, or toolchain
-changes can produce a different key.
+changes can produce a different key. A content hash is used instead of a
+compile-local counter so a warm-cache wrapper replay can still join a fresh
+trace to its persisted sidecar; ordering changes would make a counter risk a
+wrong attribution rather than an explicit missing join.
 
 ## Advanced features
 
