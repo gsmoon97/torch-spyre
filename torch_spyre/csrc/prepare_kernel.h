@@ -30,6 +30,9 @@
 
 namespace spyre {
 
+// flex's callback mirror and libaiupti's AIUpti_ActivityCompute::name are
+// assumed to have the same extent. The profiler-enabled build exercises both
+// sides of this transport contract.
 inline constexpr size_t kAIUptiActivityNameMaxBytes =
     sizeof(flex::aiupti::AIUpti_ActivityCB::name) - 1;
 
