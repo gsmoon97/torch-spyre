@@ -20,6 +20,7 @@ import os
 
 import pytest
 import torch
+from torch._inductor.utils import fresh_cache
 
 
 def _spyre_available() -> bool:
@@ -63,6 +64,11 @@ class _RichMLP(torch.nn.Module):
 
     def forward(self, x):
         return self.fc2(torch.nn.functional.gelu(self.ln(self.fc1(x))))
+
+
+class _ArtifactModel(torch.nn.Module):
+    def forward(self, x):
+        return torch.relu(x + 1.0)
 
 
 def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
@@ -196,6 +202,90 @@ def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
         assert prov_logger.level == logging.ERROR
     finally:
         prov_logger.setLevel(previous_level)
+
+
+def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
+    monkeypatch,
+):
+    import torch_spyre  # noqa: F401
+
+    from torch._inductor import debug as inductor_debug
+    from torch_spyre.constants import DEVICE_NAME
+    from torch_spyre.execution.async_compile import SpyreAsyncCompile
+
+    collections = []
+    mappings = []
+    registration_calls = []
+    original_wait = SpyreAsyncCompile.wait
+    original_register = inductor_debug.set_kernel_post_grad_provenance_tracing
+
+    def capture_wait(compiler, scope):
+        original_wait(compiler, scope)
+        collections.append(compiler._last_provenance_collection)
+        mappings.append(inductor_debug.dump_inductor_provenance_info())
+
+    def capture_registration(node_schedule, kernel_name, is_extern=False):
+        ordinal = original_register(node_schedule, kernel_name, is_extern)
+        registration_calls.append((kernel_name, ordinal))
+        return ordinal
+
+    monkeypatch.setattr(SpyreAsyncCompile, "wait", capture_wait)
+    monkeypatch.setattr(
+        inductor_debug,
+        "set_kernel_post_grad_provenance_tracing",
+        capture_registration,
+    )
+
+    model = _ArtifactModel().half().to(DEVICE_NAME).eval()
+    x = torch.randn(64, 64, dtype=torch.float16, device=DEVICE_NAME)
+    compiled = torch.compile(model, dynamic=False)
+
+    with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+        with fresh_cache():
+            with torch.no_grad():
+                compiled(x)
+
+        artifacts = torch.compiler.save_cache_artifacts()
+        assert artifacts is not None
+        artifact_bytes, _ = artifacts
+
+        torch._dynamo.reset()
+        with fresh_cache():
+            torch.compiler.load_cache_artifacts(artifact_bytes)
+            with torch.no_grad():
+                torch.compile(model, dynamic=False)(x)
+
+    assert len(collections) == 2
+    fresh, replay = collections
+    assert fresh is not None
+    assert replay is not None
+    assert fresh.has_graph_lowering
+    assert not replay.has_graph_lowering
+
+    fresh_registrations = [
+        registration
+        for occurrence in fresh.kernel_occurrences.values()
+        for registration in occurrence.registrations
+    ]
+    assert fresh_registrations
+    assert len(registration_calls) == len(fresh_registrations)
+    assert {(kernel_name, ordinal) for kernel_name, ordinal in registration_calls} == {
+        (occurrence.compiler_kernel_name, registration.ordinal)
+        for occurrence in fresh.kernel_occurrences.values()
+        for registration in occurrence.registrations
+    }
+    assert {registration.alias for registration in fresh_registrations} == set(
+        mappings[0]["cppCodeToPost"]
+    )
+
+    assert all(
+        not occurrence.registrations
+        for occurrence in replay.kernel_occurrences.values()
+    )
+    assert replay.compile_id == fresh.compile_id
+    assert replay.handles == fresh.handles
+    assert replay.kernel_identities == fresh.kernel_identities
+    assert replay.kernel_occurrences.keys() == fresh.kernel_occurrences.keys()
 
 
 def test_split_multi_ops_records_history_during_real_compile(monkeypatch):

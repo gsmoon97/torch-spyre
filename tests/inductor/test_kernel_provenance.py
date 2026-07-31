@@ -31,7 +31,9 @@ import regex as re
 
 import torch  # noqa: F401
 from sympy import Integer, Symbol, sympify
+from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import IndentedBuffer
+from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
     DataFormats,
@@ -43,9 +45,11 @@ from torch_spyre._inductor.op_spec import (
     IndirectAccess,
     LoopSpec,
     OpSpec,
+    ProvenanceTransform,
     SourceLoc,
     TensorArg,
     TensorWorkDivision,
+    UnimplementedOp,
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
@@ -57,6 +61,14 @@ from torch_spyre._inductor.profiler_event import (
     extract_kernel_provenance_key,
     format_kernel_provenance_event_name,
 )
+from torch_spyre._inductor.provenance_artifact import (
+    collect_kernel_provenance,
+    consume_kernel_registration_state,
+    KernelRegistrationState,
+    ProvenanceCollectionBuilder,
+    record_kernel_registration,
+)
+from torch_spyre._inductor.scheduler import SuperDSCScheduling
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
@@ -112,6 +124,23 @@ def _event_name(
     descriptor: KernelProvenanceDescriptor,
 ) -> str:
     return format_kernel_provenance_event_name(descriptor)
+
+
+def _graph_lowering(**attributes):
+    graph = object.__new__(GraphLowering)
+    graph.__dict__.update(attributes)
+    return graph
+
+
+def _registration_state(
+    *,
+    has_graph_lowering: bool = True,
+) -> KernelRegistrationState:
+    return KernelRegistrationState(
+        has_graph_lowering=has_graph_lowering,
+        registrations={},
+        capture_failed=False,
+    )
 
 
 def _generated_wrapper_roundtrip(specs):
@@ -551,6 +580,248 @@ class TestKernelProvenanceEventName:
         assert extract_kernel_provenance_key_cpp(event_name) == expected
 
 
+class TestProvenanceArtifactCollection:
+    def test_collects_valid_bundle_without_handles(self):
+        specs = [
+            _op(None),
+            LoopSpec(count=Integer(2), body=[_op(None)]),
+        ]
+        descriptor = build_kernel_provenance_descriptor(specs)
+        kernel = collect_kernel_provenance(
+            "sdsc_fused_unknown_0",
+            specs,
+            descriptor,
+        )
+        builder = ProvenanceCollectionBuilder()
+        builder.add_kernel(kernel)
+
+        collection = builder.finish(_registration_state())
+
+        assert collection is not None
+        assert collection.handles == {}
+        assert kernel.identity.direct_handle_ids == ()
+        assert kernel.identity.spec_handle_bindings == ()
+        assert kernel.identity.aten_ops == ()
+        assert kernel.identity.event_name_base == (
+            f"spyre_kernel_v1_fused_unknown_{descriptor.key}"
+        )
+        occurrence = next(iter(collection.kernel_occurrences.values()))
+        assert occurrence.identity_key == descriptor.key
+        assert occurrence.registrations == ()
+
+    def test_normalizes_nested_handles_and_preserves_compiler_order(self):
+        linear = _handle(101, aten_op="aten.linear.default")
+        relu = _handle(102, aten_op="aten.relu.default")
+        fused = DebugHandle(
+            id=200,
+            source=None,
+            aten_op=None,
+            ir_chain=("linear", "relu", "buf0"),
+            fused_from=(linear, relu),
+            transform_history=(
+                ProvenanceTransform(
+                    kind="fusion",
+                    pass_name="fuse_linear_relu",
+                    reason="same iteration space",
+                ),
+            ),
+        )
+        specs = [
+            _op(fused),
+            LoopSpec(
+                count=Integer(2),
+                body=[
+                    _op(fused),
+                    LoopSpec(count=Integer(3), body=[_op(None)]),
+                ],
+            ),
+        ]
+        descriptor = build_kernel_provenance_descriptor(specs)
+
+        kernel = collect_kernel_provenance(
+            "sdsc_fused_linear_relu_0",
+            specs,
+            descriptor,
+        )
+
+        assert kernel.identity.direct_handle_ids == ("200",)
+        assert [
+            binding.spec_path for binding in kernel.identity.spec_handle_bindings
+        ] == [(0,), (1, 0)]
+        assert list(kernel.handles) == ["101", "102", "200"]
+        assert kernel.handles["200"].to_dict() == {
+            "id": "200",
+            "source": None,
+            "aten_op": None,
+            "ir_chain": ["linear", "relu", "buf0"],
+            "fused_from": ["101", "102"],
+            "transform_history": [
+                {
+                    "kind": "fusion",
+                    "pass_name": "fuse_linear_relu",
+                    "reason": "same iteration space",
+                }
+            ],
+        }
+        assert kernel.identity.to_dict()["eventNameBase"] == (
+            f"spyre_kernel_v1_fused_linear_relu_{descriptor.key}"
+        )
+
+    def test_assigns_real_compile_and_occurrence_ids_and_deduplicates_identity(self):
+        specs = [_op(_handle(9))]
+        descriptor = build_kernel_provenance_descriptor(specs)
+        first = collect_kernel_provenance("sdsc_fused_mm_0", specs, descriptor)
+        second = collect_kernel_provenance("sdsc_fused_mm_1", specs, descriptor)
+        builder = ProvenanceCollectionBuilder()
+        builder.add_kernel(first)
+        builder.add_kernel(second)
+        graph = _graph_lowering()
+        record_kernel_registration(graph, "sdsc_fused_mm_0", 3)
+        record_kernel_registration(graph, "sdsc_fused_mm_0", 7)
+
+        collection = builder.finish(consume_kernel_registration_state(graph))
+
+        assert collection is not None
+        expected_kernels = [
+            ["sdsc_fused_mm_0", descriptor.key],
+            ["sdsc_fused_mm_1", descriptor.key],
+        ]
+        expected_compile_id = _canonical_digest(
+            {
+                "domain": "torch-spyre-compile-v1",
+                "kernels": expected_kernels,
+            }
+        )
+        assert collection.compile_id == expected_compile_id
+        assert collection.kernels == tuple(tuple(pair) for pair in expected_kernels)
+        assert list(collection.kernel_identities) == [descriptor.key]
+        assert len(collection.kernel_occurrences) == 2
+        first_occurrence_id = _canonical_digest(
+            {
+                "domain": "torch-spyre-occurrence-v1",
+                "compileId": expected_compile_id,
+                "compilerKernelName": "sdsc_fused_mm_0",
+                "identityKey": descriptor.key,
+            }
+        )
+        first_occurrence = collection.kernel_occurrences[first_occurrence_id]
+        assert [
+            registration.to_dict() for registration in first_occurrence.registrations
+        ] == [
+            {"ordinal": 3, "alias": "sdsc_fused_mm_0:3"},
+            {"ordinal": 7, "alias": "sdsc_fused_mm_0:7"},
+        ]
+
+    def test_cache_replay_keeps_identity_with_empty_registrations(self):
+        specs = [_op(_handle(9))]
+        descriptor = build_kernel_provenance_descriptor(specs)
+        kernel = collect_kernel_provenance("sdsc_fused_mm_0", specs, descriptor)
+        fresh_builder = ProvenanceCollectionBuilder()
+        fresh_builder.add_kernel(kernel)
+        replay_builder = ProvenanceCollectionBuilder()
+        replay_builder.add_kernel(kernel)
+        graph = _graph_lowering()
+        record_kernel_registration(graph, "sdsc_fused_mm_0", 1)
+
+        fresh = fresh_builder.finish(consume_kernel_registration_state(graph))
+        replay = replay_builder.finish(_registration_state(has_graph_lowering=False))
+
+        assert fresh is not None
+        assert replay is not None
+        assert fresh.has_graph_lowering
+        assert not replay.has_graph_lowering
+        assert replay.compile_id == fresh.compile_id
+        assert replay.handles == fresh.handles
+        assert replay.kernel_identities == fresh.kernel_identities
+        assert replay.kernel_occurrences.keys() == fresh.kernel_occurrences.keys()
+        replay_occurrence = next(iter(replay.kernel_occurrences.values()))
+        assert replay_occurrence.registrations == ()
+
+    def test_no_graph_state_is_explicit_and_rejects_registration(self):
+        registration_state = consume_kernel_registration_state(V.graph)
+
+        assert not registration_state.has_graph_lowering
+        assert registration_state.registrations == {}
+        with pytest.raises(
+            TypeError,
+            match="requires a real GraphLowering",
+        ):
+            record_kernel_registration(V.graph, "sdsc_fused_mm_0", 1)
+
+    def test_rejects_conflicting_content_for_one_handle_id(self):
+        first = _handle(101, source=SourceLoc("first.py", 10))
+        conflicting = _handle(101, source=SourceLoc("second.py", 20))
+        fused = _handle(200, fused_from=(first, conflicting))
+        specs = [_op(fused)]
+        descriptor = build_kernel_provenance_descriptor(specs)
+
+        with pytest.raises(
+            ValueError,
+            match="conflicting content for debug handle ID 101",
+        ):
+            collect_kernel_provenance("sdsc_fused_mm_0", specs, descriptor)
+
+    def test_rejects_unsupported_finalized_spec(self):
+        descriptor = build_kernel_provenance_descriptor([])
+
+        with pytest.raises(TypeError, match="Unsupported finalized kernel spec"):
+            collect_kernel_provenance(
+                "sdsc_unknown_0",
+                [object()],  # type: ignore[list-item]
+                descriptor,
+            )
+
+    def test_scheduler_registers_once_and_retains_repeated_exact_aliases(self):
+        comments = []
+        definitions = []
+        wrapper = types.SimpleNamespace(
+            src_to_kernel={},
+            next_kernel_suffix=lambda: "0",
+            define_kernel=lambda *args: definitions.append(args),
+            write_provenance_debug_handle=lambda name, handle: comments.append(
+                (name, handle)
+            ),
+        )
+        graph = _graph_lowering(wrapper_code=wrapper)
+        scheduling = object.__new__(SuperDSCScheduling)
+        node_schedule = [object()]
+
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre._inductor.scheduler.get_fused_kernel_name",
+                return_value="fused_mm",
+            ),
+            patch(
+                "torch_spyre._inductor.scheduler.get_kernel_metadata",
+                return_value=("origins", "detailed origins"),
+            ),
+            patch(
+                "torch._inductor.debug.set_kernel_post_grad_provenance_tracing",
+                side_effect=(4, 9),
+            ) as register,
+        ):
+            first_name = scheduling.define_kernel("[]", node_schedule, object())
+            scheduling.codegen_comment(node_schedule, first_name)
+            second_name = scheduling.define_kernel("[]", node_schedule, object())
+            scheduling.codegen_comment(node_schedule, second_name)
+
+        registrations = consume_kernel_registration_state(graph).registrations
+        assert first_name == second_name == "sdsc_fused_mm_0"
+        assert len(definitions) == 1
+        assert register.call_count == 2
+        assert comments == [
+            ("sdsc_fused_mm_0", 4),
+            ("sdsc_fused_mm_0", 9),
+        ]
+        assert [
+            registration.to_dict() for registration in registrations["sdsc_fused_mm_0"]
+        ] == [
+            {"ordinal": 4, "alias": "sdsc_fused_mm_0:4"},
+            {"ordinal": 9, "alias": "sdsc_fused_mm_0:9"},
+        ]
+
+
 class TestKernelProvenancePropagation:
     def test_async_compile_builds_descriptor_from_finalized_specs(self):
         specs = [
@@ -577,6 +848,184 @@ class TestKernelProvenancePropagation:
         descriptor = runner_type.call_args.kwargs["kernel_provenance"]
         assert descriptor.debug_handle_ids == ("9", "12")
         assert extract_kernel_provenance_key(_event_name(descriptor)) == descriptor.key
+
+    def test_async_compile_finalizes_graph_scoped_collection_at_wait(self):
+        specs = [
+            _op(_handle(9)),
+            LoopSpec(count=Integer(2), body=[_op(_handle(12))]),
+        ]
+        runner = object()
+        compiler = SpyreAsyncCompile()
+        graph = _graph_lowering()
+
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ),
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait") as base_wait,
+        ):
+            result = compiler.sdsc("sdsc_fused_mm_0", specs)
+            record_kernel_registration(graph, "sdsc_fused_mm_0", 6)
+            compiler.wait({})
+
+        assert result is runner
+        base_wait.assert_called_once_with({})
+        collection = compiler._last_provenance_collection
+        assert collection is not None
+        assert list(collection.handles) == ["12", "9"]
+        assert len(collection.kernel_identities) == 1
+        occurrence = next(iter(collection.kernel_occurrences.values()))
+        assert occurrence.compiler_kernel_name == "sdsc_fused_mm_0"
+        assert [
+            registration.to_dict() for registration in occurrence.registrations
+        ] == [{"ordinal": 6, "alias": "sdsc_fused_mm_0:6"}]
+        assert compiler._artifact_collection_failure_count == 0
+
+    def test_artifact_collection_failure_preserves_phase3a_descriptor(self):
+        specs = [_op(_handle(9))]
+        runner = object()
+        compiler = SpyreAsyncCompile()
+        graph = _graph_lowering()
+
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.collect_kernel_provenance",
+                side_effect=RuntimeError("artifact-only failure"),
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ) as runner_type,
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
+            patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+        ):
+            result = compiler.sdsc("sdsc_fused_mm_0", specs)
+            compiler.wait({})
+
+        descriptor = runner_type.call_args.kwargs["kernel_provenance"]
+        assert result is runner
+        assert descriptor is not None
+        assert descriptor.debug_handle_ids == ("9",)
+        assert extract_kernel_provenance_key(_event_name(descriptor)) == descriptor.key
+        collection = compiler._last_provenance_collection
+        assert collection is not None
+        assert collection.kernel_identities == {}
+        assert collection.collection_failure_count == 1
+        assert collection.uncollected_kernels[0].compiler_kernel_name == (
+            "sdsc_fused_mm_0"
+        )
+        assert warning.call_count == 2
+        assert warning.call_args_list[0].kwargs["exc_info"] is True
+        assert warning.call_args_list[1].args == (
+            "provenance artifact collection incomplete after %d failure(s) "
+            "across %d compiled Spyre kernels",
+            1,
+            1,
+        )
+
+    def test_unimplemented_kernel_does_not_discard_successful_collection(self):
+        valid_specs = [_op(_handle(9))]
+        unimplemented_specs = [UnimplementedOp("future_op")]
+        valid_runner = object()
+        unimplemented_runner = object()
+        compiler = SpyreAsyncCompile()
+        graph = _graph_lowering()
+
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=valid_runner,
+            ),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreUnimplementedRunner",
+                return_value=unimplemented_runner,
+            ),
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
+        ):
+            assert compiler.sdsc("sdsc_fused_mm_0", valid_specs) is valid_runner
+            assert (
+                compiler.sdsc("sdsc_future_op_1", unimplemented_specs)
+                is unimplemented_runner
+            )
+            record_kernel_registration(graph, "sdsc_fused_mm_0", 1)
+            record_kernel_registration(graph, "sdsc_future_op_1", 2)
+            compiler.wait({})
+
+        collection = compiler._last_provenance_collection
+        assert collection is not None
+        assert len(collection.kernel_identities) == 1
+        assert collection.collection_failure_count == 1
+        assert [
+            registration.alias
+            for registration in collection.uncollected_kernels[0].registrations
+        ] == ["sdsc_future_op_1:2"]
+        occurrence = next(iter(collection.kernel_occurrences.values()))
+        assert [registration.alias for registration in occurrence.registrations] == [
+            "sdsc_fused_mm_0:1"
+        ]
+
+    def test_descriptor_failure_does_not_discard_successful_collection(self):
+        valid_specs = [_op(_handle(9))]
+        invalid_specs = [_op(_handle(12), op_info={"future_value": object()})]
+        runner = object()
+        compiler = SpyreAsyncCompile()
+        graph = _graph_lowering()
+
+        with (
+            V.set_graph_handler(graph),
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ),
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
+        ):
+            assert compiler.sdsc("sdsc_fused_mm_0", valid_specs) is runner
+            assert compiler.sdsc("sdsc_invalid_1", invalid_specs) is runner
+            record_kernel_registration(graph, "sdsc_fused_mm_0", 1)
+            record_kernel_registration(graph, "sdsc_invalid_1", 2)
+            compiler.wait({})
+
+        collection = compiler._last_provenance_collection
+        assert collection is not None
+        assert len(collection.kernel_identities) == 1
+        assert collection.collection_failure_count == 1
+        assert collection.uncollected_kernels[0].compiler_kernel_name == (
+            "sdsc_invalid_1"
+        )
+        assert [
+            registration.alias
+            for registration in collection.uncollected_kernels[0].registrations
+        ] == ["sdsc_invalid_1:2"]
+        occurrence = next(iter(collection.kernel_occurrences.values()))
+        assert occurrence.compiler_kernel_name == "sdsc_fused_mm_0"
 
     def test_async_compile_keeps_execution_on_unknown_bundle_value(self):
         specs = [_op(_handle(9), op_info={"future_value": object()})]
