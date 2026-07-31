@@ -22,6 +22,7 @@ import uuid
 
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch._inductor.virtualized import V
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -31,6 +32,12 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
+)
+from torch_spyre._inductor.provenance_artifact import (
+    collect_kernel_provenance,
+    CollectedProvenance,
+    consume_kernel_registration_state,
+    ProvenanceCollectionBuilder,
 )
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
@@ -63,6 +70,11 @@ class SpyreAsyncCompile(AsyncCompile):
         super().__init__()
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        self._artifact_collection_builder = ProvenanceCollectionBuilder()
+        self._artifact_collection_failure_count = 0
+        # Checkpoint seam consumed by Milestone 2 publication and integration tests.
+        self._last_provenance_collection: CollectedProvenance | None = None
+        self._provenance_wait_completed = False
 
     def triton(self, *args, **kwargs):
         raise NotImplementedError(
@@ -80,7 +92,9 @@ class SpyreAsyncCompile(AsyncCompile):
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
     ):
         unimp = find_unimplemented(list(specs))
+        self._provenance_attempt_count += 1
         if unimp is not None:
+            self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
             logger.warning(
                 f"WARNING: Compiling unimplemented {unimp.op} to runtime exception"
             )
@@ -90,7 +104,6 @@ class SpyreAsyncCompile(AsyncCompile):
         output_dir = get_output_dir(kernel_name)
         generate_bundle(kernel_name, output_dir, specs)
 
-        self._provenance_attempt_count += 1
         try:
             # This is the common fresh-compile/cache-reload boundary: generated
             # wrappers have reconstructed the finalized OpSpecs before calling
@@ -113,6 +126,27 @@ class SpyreAsyncCompile(AsyncCompile):
                 )
             kernel_provenance = None
 
+            self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
+        if kernel_provenance is not None:
+            try:
+                collected_kernel = collect_kernel_provenance(
+                    kernel_name,
+                    finalized_specs,
+                    kernel_provenance,
+                )
+                self._artifact_collection_builder.add_kernel(collected_kernel)
+            except Exception:  # noqa: BLE001 - provenance must never fail the build
+                self._artifact_collection_failure_count += 1
+                if self._artifact_collection_failure_count == 1:
+                    logger.warning(
+                        "provenance artifact collection failed for kernel %s; "
+                        "continuing without a sidecar contribution; additional "
+                        "failures in this compilation will be summarized",
+                        kernel_name,
+                        exc_info=True,
+                    )
+
+                self._artifact_collection_builder.add_uncollected_kernel(kernel_name)
         # Invoke backend compiler of SDSC Bundle
         with torch.profiler.record_function(f"dxp_standalone:{kernel_name}"):
             try:
@@ -171,11 +205,40 @@ class SpyreAsyncCompile(AsyncCompile):
 
     def wait(self, scope: dict[str, Any]) -> None:
         super().wait(scope)
+        if self._provenance_wait_completed:
+            return
+        self._provenance_wait_completed = True
+        self._last_provenance_collection = None
+        try:
+            registration_state = consume_kernel_registration_state(V.graph)
+            self._last_provenance_collection = self._artifact_collection_builder.finish(
+                registration_state
+            )
+            if registration_state.capture_failed:
+                self._artifact_collection_failure_count += 1
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            self._artifact_collection_failure_count += 1
+            if self._artifact_collection_failure_count == 1:
+                logger.warning(
+                    "provenance artifact finalization failed; continuing without "
+                    "a sidecar contribution",
+                    exc_info=True,
+                )
+
         if self._provenance_failure_count:
             logger.warning(
                 "kernel provenance disabled for %d/%d compiled Spyre kernels",
                 self._provenance_failure_count,
                 self._provenance_attempt_count,
             )
+        if self._artifact_collection_failure_count:
+            logger.warning(
+                "provenance artifact collection incomplete after %d failure(s) "
+                "across %d compiled Spyre kernels",
+                self._artifact_collection_failure_count,
+                self._provenance_attempt_count,
+            )
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
+        self._artifact_collection_builder = ProvenanceCollectionBuilder()
+        self._artifact_collection_failure_count = 0
