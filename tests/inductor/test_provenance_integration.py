@@ -14,6 +14,7 @@
 
 """Device integration test: provenance survives a real Spyre compile end-to-end."""
 
+import json
 import logging
 import logging.handlers
 import os
@@ -208,6 +209,7 @@ def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.delenv("TORCH_TRACE", raising=False)
     import torch_spyre  # noqa: F401
 
     from torch._inductor import debug as inductor_debug
@@ -285,6 +287,40 @@ def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
     }
     assert {registration.alias for registration in fresh_registrations} == set(
         mappings[0]["cppCodeToPost"]
+    )
+    registration_aliases = {registration.alias for registration in fresh_registrations}
+    sidecar = json.loads(fresh_sidecar_bytes)
+    assert sidecar["status"] == "complete"
+    assert sidecar["diagnostics"] == {}
+    projection = sidecar["upstreamProjections"][fresh.compile_id]
+    assert projection["upstreamJoin"] == "ok"
+    assert set(projection["cppCodeToPost"]) == registration_aliases
+    assert projection["cppCodeToPost"] == {
+        alias: mappings[0]["cppCodeToPost"][alias]
+        for alias in sorted(registration_aliases)
+    }
+    reachable_post_nodes = {
+        post_node
+        for post_nodes in projection["cppCodeToPost"].values()
+        for post_node in post_nodes
+    }
+    assert projection["postToPre"] == {
+        post_node: mappings[0]["postToPre"][post_node]
+        for post_node in sorted(reachable_post_nodes)
+    }
+    assert set(projection["kernelStackTraces"]) == registration_aliases
+    assert all(
+        context["postGradNodes"] == projection["cppCodeToPost"][alias]
+        for alias, context in projection["kernelStackTraces"].items()
+    )
+
+    from torch_spyre._inductor.profiler_event import (
+        extract_kernel_provenance_key,
+    )
+
+    assert all(
+        extract_kernel_provenance_key(identity["eventNameBase"]) == identity_key
+        for identity_key, identity in sidecar["kernelIdentities"].items()
     )
 
     assert all(

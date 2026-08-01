@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -28,6 +29,8 @@ from typing import Any, Literal
 
 import regex as re
 import torch
+from torch._inductor import debug as inductor_debug
+from torch._logging._internal import trace_log, trace_structured_artifact
 
 from torch_spyre._inductor.kernel_provenance import (
     KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
@@ -42,6 +45,7 @@ from torch_spyre.version import __version__ as torch_spyre_version
 
 
 PublicationResult = Literal["disabled", "unchanged", "written"]
+UpstreamJoin = Literal["ok", "partial"]
 
 _SCHEMA_VERSION = 1
 _UPSTREAM_SOURCE = "inductor_provenance_tracking_node_mappings"
@@ -101,6 +105,31 @@ class UnsupportedProvenanceVersion(ProvenanceArtifactError):
     """Existing sidecar uses a schema version this writer cannot merge."""
 
 
+@dataclasses.dataclass(frozen=True)
+class CapturedUpstreamProjection:
+    """Filtered live Inductor relationships for one wrapper contribution."""
+
+    upstream_join: UpstreamJoin
+    pre_to_post: Mapping[str, tuple[str, ...]]
+    post_to_pre: Mapping[str, tuple[str, ...]]
+    cpp_code_to_post: Mapping[str, tuple[str, ...]]
+    post_to_cpp_code: Mapping[str, tuple[str, ...]]
+    kernel_stack_traces: Mapping[str, Mapping[str, tuple[str, ...]]]
+    failed: bool
+
+    def to_projection_fields(self) -> dict[str, object]:
+        return {
+            "preToPost": _lists_from_tuples(self.pre_to_post),
+            "postToPre": _lists_from_tuples(self.post_to_pre),
+            "cppCodeToPost": _lists_from_tuples(self.cpp_code_to_post),
+            "postToCppCode": _lists_from_tuples(self.post_to_cpp_code),
+            "kernelStackTraces": {
+                alias: _lists_from_tuples(context)
+                for alias, context in self.kernel_stack_traces.items()
+            },
+        }
+
+
 def resolve_provenance_artifact_path(
     configured_path: str | None,
 ) -> Path | None:
@@ -113,16 +142,121 @@ def resolve_provenance_artifact_path(
     return path.absolute()
 
 
+def capture_upstream_projection(
+    collection: CollectedProvenance,
+) -> CapturedUpstreamProjection | None:
+    """Capture and filter live upstream v2 state for one fresh contribution."""
+    level = int(torch._inductor.config.trace.provenance_tracking_level)
+    if level < 1 or not collection.has_graph_lowering:
+        return None
+
+    node_mapping = inductor_debug.dump_inductor_provenance_info()
+    kernel_information = inductor_debug.create_kernel_information_json()
+    mapping = _require_mapping(node_mapping, "upstream node mapping")
+    if mapping.get("version") != _UPSTREAM_VERSION:
+        raise ProvenanceArtifactError("unsupported upstream provenance version")
+
+    aliases = sorted(
+        {
+            registration.alias
+            for occurrence in collection.kernel_occurrences.values()
+            for registration in occurrence.registrations
+        }
+    )
+    upstream_cpp_to_post = _capture_name_map(
+        mapping.get("cppCodeToPost"), "upstream cppCodeToPost"
+    )
+    upstream_post_to_pre = _capture_name_map(
+        mapping.get("postToPre"), "upstream postToPre"
+    )
+    cpp_to_post = {
+        alias: upstream_cpp_to_post[alias]
+        for alias in aliases
+        if alias in upstream_cpp_to_post
+    }
+    reachable_post_nodes = {
+        post_node for values in cpp_to_post.values() for post_node in values
+    }
+    post_to_pre = {
+        post_node: upstream_post_to_pre[post_node]
+        for post_node in sorted(reachable_post_nodes)
+        if post_node in upstream_post_to_pre
+    }
+    pre_to_post = _tuple_name_map(_invert_name_map(post_to_pre))
+    post_to_cpp = _tuple_name_map(_invert_name_map(cpp_to_post))
+
+    upstream_stacks = _require_mapping(
+        kernel_information, "upstream kernel information"
+    )
+    stack_contexts: dict[str, Mapping[str, tuple[str, ...]]] = {}
+    stack_contexts_match = True
+    for alias in aliases:
+        value = upstream_stacks.get(alias)
+        if value is None:
+            continue
+        context = _require_mapping(value, "upstream kernel stack context")
+        stack_traces = _capture_string_tuple(
+            context.get("stack_traces"), "upstream stack traces"
+        )
+        post_grad_nodes = _capture_string_tuple(
+            context.get("post_grad_nodes"), "upstream stack post-grad nodes"
+        )
+        pre_grad_nodes = _capture_string_tuple(
+            context.get("pre_grad_nodes"), "upstream stack pre-grad nodes"
+        )
+        expected_post_nodes = cpp_to_post.get(alias, ())
+        expected_pre_nodes = tuple(
+            dict.fromkeys(
+                pre_node
+                for post_node in expected_post_nodes
+                for pre_node in post_to_pre.get(post_node, ())
+            )
+        )
+        stack_contexts_match &= (
+            post_grad_nodes == expected_post_nodes
+            and pre_grad_nodes == expected_pre_nodes
+        )
+        stack_contexts[alias] = {
+            "stackTraces": stack_traces,
+            "postGradNodes": post_grad_nodes,
+            "preGradNodes": pre_grad_nodes,
+        }
+
+    complete = (
+        bool(aliases)
+        and set(cpp_to_post) == set(aliases)
+        and all(cpp_to_post.values())
+        and set(post_to_pre) == reachable_post_nodes
+        and set(stack_contexts) == set(aliases)
+        and stack_contexts_match
+    )
+    return CapturedUpstreamProjection(
+        upstream_join="ok" if complete else "partial",
+        pre_to_post=pre_to_post,
+        post_to_pre=post_to_pre,
+        cpp_code_to_post=cpp_to_post,
+        post_to_cpp_code=post_to_cpp,
+        kernel_stack_traces=stack_contexts,
+        failed=not complete,
+    )
+
+
 def publish_provenance_collection(
     collection: CollectedProvenance,
     configured_path: str | None,
+    *,
+    upstream_projection: CapturedUpstreamProjection | None = None,
+    upstream_projection_failed: bool = False,
 ) -> PublicationResult:
     """Merge and atomically publish one wrapper's collection outcome."""
     path = resolve_provenance_artifact_path(configured_path)
     if path is None:
         return "disabled"
 
-    contribution = _build_contribution(collection)
+    contribution = _build_contribution(
+        collection, upstream_projection_failed, upstream_projection
+    )
+    result: PublicationResult = "written"
     with _PUBLICATION_LOCK:
         existing = _read_existing_document(path)
         if existing is None:
@@ -135,12 +269,22 @@ def publish_provenance_collection(
             validate_provenance_document(existing)
             document = _merge_document(existing, contribution)
             if _without_generation(document) == _without_generation(existing):
-                return "unchanged"
+                result = "unchanged"
 
         document = _canonicalize_document(document)
         validate_provenance_document(document)
-        _atomic_write(path, _serialize_document(document))
-    return "written"
+        payload = _serialize_document(document)
+        if result == "written":
+            _atomic_write(path, payload)
+
+    # Always submit enabled publications to PyTorch logging. Its handlers own
+    # durable trace emission; structuredTracing only records destination state.
+    trace_structured_artifact(
+        "spyre_provenance",
+        "json",
+        payload_fn=lambda: payload,
+    )
+    return result
 
 
 def validate_provenance_document(document: object) -> None:
@@ -238,7 +382,11 @@ def validate_provenance_document(document: object) -> None:
         raise ProvenanceArtifactError("document status disagrees with its content")
 
 
-def _build_contribution(collection: CollectedProvenance) -> dict[str, Any]:
+def _build_contribution(
+    collection: CollectedProvenance,
+    upstream_projection_failed: bool,
+    upstream_projection: CapturedUpstreamProjection | None,
+) -> dict[str, Any]:
     handles = {
         handle_id: handle.to_dict() for handle_id, handle in collection.handles.items()
     }
@@ -257,8 +405,14 @@ def _build_contribution(collection: CollectedProvenance) -> dict[str, Any]:
             upstream_join = "unavailable-provenance-level-0"
         elif not collection.has_graph_lowering:
             upstream_join = "unavailable-cache-replay"
-        else:
+        elif collection.registration_capture_failed or upstream_projection_failed:
             upstream_join = "partial"
+        else:
+            upstream_join = (
+                upstream_projection.upstream_join
+                if upstream_projection is not None
+                else "partial"
+            )
         projections[collection.compile_id] = {
             "source": _UPSTREAM_SOURCE,
             "version": _UPSTREAM_VERSION,
@@ -268,7 +422,7 @@ def _build_contribution(collection: CollectedProvenance) -> dict[str, Any]:
             },
             "settings": {
                 "provenanceTrackingLevel": level,
-                "structuredTracing": bool(torch._inductor.config.trace.enabled),
+                "structuredTracing": _structured_tracing_enabled(),
             },
             "kernels": [
                 {
@@ -278,10 +432,13 @@ def _build_contribution(collection: CollectedProvenance) -> dict[str, Any]:
                 for kernel_name, identity_key in collection.kernels
             ],
             "uncollectedKernels": sorted(
-                kernel.compiler_kernel_name
-                for kernel in collection.uncollected_kernels
+                kernel.compiler_kernel_name for kernel in collection.uncollected_kernels
             ),
-            "upstreamProjectionFailed": collection.registration_capture_failed,
+            "upstreamProjectionFailed": (
+                collection.registration_capture_failed
+                or upstream_projection_failed
+                or (upstream_projection.failed if upstream_projection else False)
+            ),
             "upstreamJoin": upstream_join,
             "preToPost": {},
             "postToPre": {},
@@ -289,6 +446,10 @@ def _build_contribution(collection: CollectedProvenance) -> dict[str, Any]:
             "postToCppCode": {},
             "kernelStackTraces": {},
         }
+        if upstream_projection is not None:
+            projections[collection.compile_id].update(
+                upstream_projection.to_projection_fields()
+            )
     return {
         "diagnostics": _diagnostics_from_projections(projections),
         "handles": handles,
@@ -407,8 +568,7 @@ def _merge_projections(destination_value: object, incoming_value: object) -> Non
                     f"conflicting upstream projection metadata for key {compile_id}"
                 )
         uncollected_kernels = sorted(
-            set(existing["uncollectedKernels"])
-            | set(projection["uncollectedKernels"])
+            set(existing["uncollectedKernels"]) | set(projection["uncollectedKernels"])
         )
         upstream_projection_failed = bool(
             existing["upstreamProjectionFailed"]
@@ -516,9 +676,7 @@ def _name_map_is_subset(weaker_value: object, richer_value: object) -> bool:
     )
 
 
-def _merge_name_maps(
-    first_value: object, second_value: object
-) -> dict[str, list[str]]:
+def _merge_name_maps(first_value: object, second_value: object) -> dict[str, list[str]]:
     first = _require_mapping(first_value, "name map")
     second = _require_mapping(second_value, "name map")
     keys = sorted(set(first) | set(second))
@@ -534,6 +692,39 @@ def _invert_name_map(mapping_value: object) -> dict[str, list[str]]:
         for destination in mapping[source]:
             inverse.setdefault(destination, []).append(source)
     return inverse
+
+
+def _capture_name_map(value: object, name: str) -> dict[str, tuple[str, ...]]:
+    mapping = _require_mapping(value, name)
+    return {key: _capture_string_tuple(values, name) for key, values in mapping.items()}
+
+
+def _capture_string_tuple(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ProvenanceArtifactError(f"{name} must be an array")
+    if not all(isinstance(item, str) for item in value):
+        raise ProvenanceArtifactError(f"{name} entries must be strings")
+    if len(value) != len(set(value)):
+        raise ProvenanceArtifactError(f"{name} entries must be unique")
+    return tuple(value)
+
+
+def _tuple_name_map(
+    mapping: Mapping[str, Sequence[str]],
+) -> dict[str, tuple[str, ...]]:
+    return {key: tuple(values) for key, values in mapping.items()}
+
+
+def _lists_from_tuples(
+    mapping: Mapping[str, Sequence[str]],
+) -> dict[str, list[str]]:
+    return {key: list(values) for key, values in mapping.items()}
+
+
+def _structured_tracing_enabled() -> bool:
+    return any(
+        getattr(handler, "root_dir", None) is not None for handler in trace_log.handlers
+    )
 
 
 def _derive_status(document: dict[str, Any]) -> None:
@@ -555,17 +746,13 @@ def _diagnostics_from_projections(
     for projection_value in projections.values():
         projection = _require_mapping(projection_value, "upstream projection")
         collection_failure_count += len(projection["uncollectedKernels"])
-        upstream_projection_failure_count += int(
-            projection["upstreamProjectionFailed"]
-        )
+        upstream_projection_failure_count += int(projection["upstreamProjectionFailed"])
 
     diagnostics: dict[str, int] = {}
     if collection_failure_count:
         diagnostics["collection-failure"] = collection_failure_count
     if upstream_projection_failure_count:
-        diagnostics["upstream-projection-failure"] = (
-            upstream_projection_failure_count
-        )
+        diagnostics["upstream-projection-failure"] = upstream_projection_failure_count
     return diagnostics
 
 
