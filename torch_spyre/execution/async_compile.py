@@ -42,7 +42,10 @@ from torch_spyre._inductor.provenance_artifact import (
     consume_kernel_registration_state,
     ProvenanceCollectionBuilder,
 )
-from torch_spyre._inductor.provenance_writer import publish_provenance_collection
+from torch_spyre._inductor.provenance_writer import (
+    capture_upstream_projection,
+    publish_provenance_collection,
+)
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
@@ -132,6 +135,7 @@ class SpyreAsyncCompile(AsyncCompile):
         self._provenance_failure_count = 0
         self._artifact_collection_builder = ProvenanceCollectionBuilder()
         self._artifact_collection_failure_count = 0
+        self._artifact_upstream_projection_failed = False
         self._artifact_publication_failure_count = 0
         # Retained after wait() for publication diagnostics and integration tests.
         self._last_provenance_collection: CollectedProvenance | None = None
@@ -373,13 +377,15 @@ class SpyreAsyncCompile(AsyncCompile):
             return
         self._provenance_wait_completed = True
         self._last_provenance_collection = None
+        upstream_projection = None
+        upstream_projection_failed = False
         try:
             registration_state = consume_kernel_registration_state(V.graph)
             self._last_provenance_collection = self._artifact_collection_builder.finish(
                 registration_state
             )
             if registration_state.capture_failed:
-                self._artifact_collection_failure_count += 1
+                upstream_projection_failed = True
         except Exception:  # noqa: BLE001 - provenance must never fail the build
             self._artifact_collection_failure_count += 1
             if self._artifact_collection_failure_count == 1:
@@ -389,11 +395,36 @@ class SpyreAsyncCompile(AsyncCompile):
                     exc_info=True,
                 )
 
+        configured_path = spyre_config.provenance_artifact_path
+        if (
+            configured_path
+            and self._last_provenance_collection is not None
+            and self._last_provenance_collection.kernels
+        ):
+            try:
+                upstream_projection = capture_upstream_projection(
+                    self._last_provenance_collection
+                )
+                if upstream_projection is not None and upstream_projection.failed:
+                    upstream_projection_failed = True
+            except Exception:  # noqa: BLE001 - projection must never fail the build
+                upstream_projection_failed = True
+                logger.warning(
+                    "upstream provenance projection capture failed; continuing "
+                    "with a partial sidecar",
+                    exc_info=True,
+                )
+
+        if upstream_projection_failed:
+            self._artifact_upstream_projection_failed = True
+
         if self._last_provenance_collection is not None:
             try:
                 publication_result = publish_provenance_collection(
                     self._last_provenance_collection,
-                    spyre_config.provenance_artifact_path,
+                    configured_path,
+                    upstream_projection=upstream_projection,
+                    upstream_projection_failed=upstream_projection_failed,
                 )
                 if publication_result == "disabled":
                     _log_publication_disabled_once()
@@ -431,6 +462,10 @@ class SpyreAsyncCompile(AsyncCompile):
                 self._artifact_collection_failure_count,
                 self._provenance_attempt_count,
             )
+        if self._artifact_upstream_projection_failed:
+            logger.warning(
+                "provenance upstream projection incomplete for this generated wrapper"
+            )
         if self._artifact_publication_failure_count:
             logger.warning(
                 "provenance sidecar publication incomplete after %d failure(s) "
@@ -442,4 +477,5 @@ class SpyreAsyncCompile(AsyncCompile):
         self._provenance_failure_count = 0
         self._artifact_collection_builder = ProvenanceCollectionBuilder()
         self._artifact_collection_failure_count = 0
+        self._artifact_upstream_projection_failed = False
         self._artifact_publication_failure_count = 0
