@@ -112,6 +112,8 @@
           "identityKey": "vsancadvtjfcq6cv"
         }
       ],
+      "uncollectedKernels": [],
+      "upstreamProjectionFailed": false,
       "upstreamJoin": "unavailable-cache-replay",
       "preToPost": {},
       "postToPre": {},

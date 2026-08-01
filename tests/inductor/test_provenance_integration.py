@@ -206,10 +206,12 @@ def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
 
 def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
     monkeypatch,
+    tmp_path,
 ):
     import torch_spyre  # noqa: F401
 
     from torch._inductor import debug as inductor_debug
+    from torch_spyre._inductor import config as spyre_config
     from torch_spyre.constants import DEVICE_NAME
     from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
@@ -239,12 +241,17 @@ def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
     model = _ArtifactModel().half().to(DEVICE_NAME).eval()
     x = torch.randn(64, 64, dtype=torch.float16, device=DEVICE_NAME)
     compiled = torch.compile(model, dynamic=False)
+    sidecar_path = tmp_path / "spyre_provenance.json"
 
-    with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+    with (
+        spyre_config.patch({"provenance_artifact_path": str(sidecar_path)}),
+        torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+    ):
         with fresh_cache():
             with torch.no_grad():
                 compiled(x)
 
+        fresh_sidecar_bytes = sidecar_path.read_bytes()
         artifacts = torch.compiler.save_cache_artifacts()
         assert artifacts is not None
         artifact_bytes, _ = artifacts
@@ -254,6 +261,8 @@ def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
             torch.compiler.load_cache_artifacts(artifact_bytes)
             with torch.no_grad():
                 torch.compile(model, dynamic=False)(x)
+
+    assert sidecar_path.read_bytes() == fresh_sidecar_bytes
 
     assert len(collections) == 2
     fresh, replay = collections
