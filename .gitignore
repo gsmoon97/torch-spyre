@@ -398,5 +398,6 @@ test/*.json
 .*env*
 stubs
 
-# provenance audit outputs
+# provenance outputs
 provenance_capture_raw.json
+spyre_provenance.json

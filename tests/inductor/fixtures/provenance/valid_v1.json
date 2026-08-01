@@ -132,6 +132,8 @@
           "identityKey": "vsancadvtjfcq6cv"
         }
       ],
+      "uncollectedKernels": [],
+      "upstreamProjectionFailed": false,
       "upstreamJoin": "ok",
       "preToPost": {
         "linear": ["permute", "mm", "add"],
@@ -196,6 +198,8 @@
           "identityKey": "atqydvnuutl766na"
         }
       ],
+      "uncollectedKernels": [],
+      "upstreamProjectionFailed": false,
       "upstreamJoin": "unavailable-provenance-level-0",
       "preToPost": {},
       "postToPre": {},

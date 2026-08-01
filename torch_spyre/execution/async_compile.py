@@ -17,12 +17,14 @@ from typing import Any, cast
 from collections.abc import Sequence
 import os
 import subprocess
+import threading
 import torch
 import uuid
 
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch._inductor.virtualized import V
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
     LoopSpec,
@@ -39,11 +41,37 @@ from torch_spyre._inductor.provenance_artifact import (
     consume_kernel_registration_state,
     ProvenanceCollectionBuilder,
 )
+from torch_spyre._inductor.provenance_writer import publish_provenance_collection
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
+
+_publication_disabled_lock = threading.Lock()
+_publication_disabled_logged = False
+_provenance_level_zero_lock = threading.Lock()
+_provenance_level_zero_logged = False
+
+
+def _log_publication_disabled_once() -> None:
+    global _publication_disabled_logged
+    with _publication_disabled_lock:
+        if not _publication_disabled_logged:
+            logger.debug("Spyre provenance sidecar publication is disabled")
+            _publication_disabled_logged = True
+
+
+def _log_provenance_level_zero_once() -> None:
+    global _provenance_level_zero_logged
+    with _provenance_level_zero_lock:
+        if not _provenance_level_zero_logged:
+            logger.warning(
+                "Spyre provenance upstream projection is unavailable; set "
+                "torch._inductor.config.trace.provenance_tracking_level=1 "
+                "to enable it"
+            )
+            _provenance_level_zero_logged = True
 
 
 def get_output_dir(kernel_name: str):
@@ -72,7 +100,8 @@ class SpyreAsyncCompile(AsyncCompile):
         self._provenance_failure_count = 0
         self._artifact_collection_builder = ProvenanceCollectionBuilder()
         self._artifact_collection_failure_count = 0
-        # Checkpoint seam consumed by Milestone 2 publication and integration tests.
+        self._artifact_publication_failure_count = 0
+        # Retained after wait() for publication diagnostics and integration tests.
         self._last_provenance_collection: CollectedProvenance | None = None
         self._provenance_wait_completed = False
 
@@ -225,6 +254,35 @@ class SpyreAsyncCompile(AsyncCompile):
                     exc_info=True,
                 )
 
+        if self._last_provenance_collection is not None:
+            try:
+                publication_result = publish_provenance_collection(
+                    self._last_provenance_collection,
+                    spyre_config.provenance_artifact_path,
+                )
+                if publication_result == "disabled":
+                    _log_publication_disabled_once()
+                elif (
+                    self._last_provenance_collection.kernels
+                    and torch._inductor.config.trace.provenance_tracking_level < 1
+                ):
+                    _log_provenance_level_zero_once()
+            except Exception:  # noqa: BLE001 - publication must never fail the build
+                self._artifact_publication_failure_count += 1
+                if self._artifact_publication_failure_count == 1:
+                    configured_path = spyre_config.provenance_artifact_path
+                    basename = (
+                        os.path.basename(configured_path)
+                        if configured_path
+                        else "spyre_provenance.json"
+                    )
+                    logger.warning(
+                        "provenance sidecar publication failed for %s; "
+                        "continuing compilation",
+                        basename,
+                        exc_info=True,
+                    )
+
         if self._provenance_failure_count:
             logger.warning(
                 "kernel provenance disabled for %d/%d compiled Spyre kernels",
@@ -238,7 +296,15 @@ class SpyreAsyncCompile(AsyncCompile):
                 self._artifact_collection_failure_count,
                 self._provenance_attempt_count,
             )
+        if self._artifact_publication_failure_count:
+            logger.warning(
+                "provenance sidecar publication incomplete after %d failure(s) "
+                "across %d compiled Spyre kernels",
+                self._artifact_publication_failure_count,
+                self._provenance_attempt_count,
+            )
         self._provenance_attempt_count = 0
         self._provenance_failure_count = 0
         self._artifact_collection_builder = ProvenanceCollectionBuilder()
         self._artifact_collection_failure_count = 0
+        self._artifact_publication_failure_count = 0

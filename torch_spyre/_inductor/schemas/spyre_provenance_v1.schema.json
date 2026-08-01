@@ -35,17 +35,17 @@
       "enum": ["complete", "partial"]
     },
     "diagnostics": {
-      "description": "Writer-side failure counts merged by code. Reader rejection diagnostics use a separate vocabulary defined by the resolver contract.",
+      "description": "Writer-side failure counts derived from compile projections. Reader rejection diagnostics use a separate vocabulary defined by the resolver contract.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "collection-failure": {
-          "description": "Number of kernels whose Spyre provenance could not be collected.",
+          "description": "Sum of the per-projection distinct uncollected kernel-name counts.",
           "type": "integer",
           "minimum": 1
         },
         "upstream-projection-failure": {
-          "description": "Number of failures while reading or filtering live upstream provenance.",
+          "description": "Number of compile projections that observed a failure while capturing or filtering upstream provenance.",
           "type": "integer",
           "minimum": 1
         }
@@ -413,6 +413,8 @@
         "producer",
         "settings",
         "kernels",
+        "uncollectedKernels",
+        "upstreamProjectionFailed",
         "upstreamJoin",
         "preToPost",
         "postToPre",
@@ -436,6 +438,19 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/compileKernel" }
+        },
+        "uncollectedKernels": {
+          "description": "Sorted set of compiler kernel names that belonged to this wrapper but could not safely produce a bundle identity.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "upstreamProjectionFailed": {
+          "description": "Whether this compile observed a failure while capturing or filtering upstream provenance.",
+          "type": "boolean"
         },
         "upstreamJoin": {
           "description": "Best available alias/projection status after merge. Richer data is never replaced by a weaker status.",

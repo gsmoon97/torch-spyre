@@ -40,6 +40,7 @@ from torch_spyre._C import (
     ElementArrangement,
     extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
 )
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -67,10 +68,19 @@ from torch_spyre._inductor.provenance_artifact import (
     ProvenanceCollectionBuilder,
     record_kernel_registration,
 )
+from torch_spyre._inductor.provenance_writer import (
+    ProvenanceArtifactError,
+    publish_provenance_collection,
+    resolve_provenance_artifact_path,
+    validate_provenance_document,
+)
 from torch_spyre._inductor.scheduler import SuperDSCScheduling
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+
+
+_DEFAULT_PROVENANCE_ARTIFACT_PATH = spyre_config.provenance_artifact_path
 
 
 def _handle(
@@ -140,6 +150,40 @@ def _registration_state(
         registrations={},
         capture_failed=False,
     )
+
+
+def _publication_collection(
+    *,
+    kernel_name: str = "sdsc_fused_mm_0",
+    handle_id: int = 9,
+    has_graph_lowering: bool = True,
+    registration_ordinal: int | None = None,
+    include_uncollected: bool = False,
+    upstream_projection_failed: bool = False,
+):
+    specs = [_op(_handle(handle_id))]
+    descriptor = build_kernel_provenance_descriptor(specs)
+    kernel = collect_kernel_provenance(kernel_name, specs, descriptor)
+    builder = ProvenanceCollectionBuilder()
+    builder.add_kernel(kernel)
+    if include_uncollected:
+        builder.add_uncollected_kernel(f"{kernel_name}_uncollected")
+
+    if has_graph_lowering:
+        graph = _graph_lowering()
+        if registration_ordinal is not None:
+            record_kernel_registration(graph, kernel_name, registration_ordinal)
+        registration_state = consume_kernel_registration_state(graph)
+    else:
+        assert registration_ordinal is None
+        registration_state = _registration_state(has_graph_lowering=False)
+    if upstream_projection_failed:
+        registration_state = dataclasses.replace(
+            registration_state, capture_failed=True
+        )
+    collection = builder.finish(registration_state)
+    assert collection is not None
+    return collection
 
 
 def _generated_wrapper_roundtrip(specs):
@@ -1263,6 +1307,11 @@ def _validate_fixture_semantics(document: dict) -> None:
         ]
         assert len(kernels) == len(set(kernels))
         assert all(identity_key in identities for _, identity_key in kernels)
+        uncollected_kernels = projection["uncollectedKernels"]
+        assert uncollected_kernels == sorted(set(uncollected_kernels))
+        assert all(uncollected_kernels)
+        assert not set(uncollected_kernels) & {name for name, _ in kernels}
+        assert isinstance(projection["upstreamProjectionFailed"], bool)
 
         compile_occurrences = occurrences_by_compile.get(compile_id, [])
         occurrence_kernels = {
@@ -1311,6 +1360,20 @@ def _validate_fixture_semantics(document: dict) -> None:
         assert projection["postToPre"] == expected_post_to_pre
 
     assert set(occurrences_by_compile) == set(projections)
+    expected_diagnostics = {}
+    collection_failure_count = sum(
+        len(projection["uncollectedKernels"]) for projection in projections.values()
+    )
+    upstream_projection_failure_count = sum(
+        projection["upstreamProjectionFailed"] for projection in projections.values()
+    )
+    if collection_failure_count:
+        expected_diagnostics["collection-failure"] = collection_failure_count
+    if upstream_projection_failure_count:
+        expected_diagnostics["upstream-projection-failure"] = (
+            upstream_projection_failure_count
+        )
+    assert document["diagnostics"] == expected_diagnostics
     expected_status = (
         "complete"
         if not document["diagnostics"]
@@ -1430,3 +1493,388 @@ class TestProvenanceArtifactSchema:
         occurrence["selector"] = "future-event-occurrence-token"
         _SCHEMA_VALIDATOR.validate(document)
         _validate_fixture_semantics(document)
+
+
+class TestProvenanceArtifactPublication:
+    def test_config_default_and_destination_resolution(self, monkeypatch, tmp_path):
+        assert _DEFAULT_PROVENANCE_ARTIFACT_PATH is not None
+        default_path = Path(_DEFAULT_PROVENANCE_ARTIFACT_PATH)
+        assert default_path.is_absolute()
+        assert default_path.name == "spyre_provenance.json"
+        assert default_path.parent.name == "torchinductor"
+        assert "torch_compile_debug" in default_path.parts
+
+        monkeypatch.chdir(tmp_path)
+        assert resolve_provenance_artifact_path("nested.json") == (
+            tmp_path / "nested.json"
+        )
+        assert resolve_provenance_artifact_path(None) is None
+        assert resolve_provenance_artifact_path("") is None
+
+    def test_publication_creates_missing_parent_directory(self, tmp_path):
+        collection = _publication_collection(registration_ordinal=1)
+        path = tmp_path / "run_0" / "torchinductor" / "spyre_provenance.json"
+        assert publish_provenance_collection(collection, str(path)) == "written"
+        assert path.exists()
+
+    def test_first_write_is_deterministic_and_schema_valid(self, tmp_path):
+        collection = _publication_collection(registration_ordinal=1)
+        first_path = tmp_path / "first.json"
+        second_path = tmp_path / "second.json"
+
+        with torch._inductor.config.patch(
+            {
+                "trace.provenance_tracking_level": 1,
+                "trace.enabled": False,
+            }
+        ):
+            assert publish_provenance_collection(collection, str(first_path)) == (
+                "written"
+            )
+            assert publish_provenance_collection(collection, str(second_path)) == (
+                "written"
+            )
+
+        assert first_path.read_bytes() == second_path.read_bytes()
+        document = json.loads(first_path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        _SCHEMA_VALIDATOR.validate(document)
+        assert document["mergeGeneration"] == 1
+        assert document["status"] == "partial"
+        projection = document["upstreamProjections"][collection.compile_id]
+        assert projection["upstreamJoin"] == "partial"
+        assert not projection["settings"]["structuredTracing"]
+
+        original = first_path.read_bytes()
+        with torch._inductor.config.patch(
+            {
+                "trace.provenance_tracking_level": 1,
+                "trace.enabled": False,
+            }
+        ):
+            assert publish_provenance_collection(collection, str(first_path)) == (
+                "unchanged"
+            )
+        assert first_path.read_bytes() == original
+
+    def test_cache_then_fresh_enriches_and_replay_cannot_erase(self, tmp_path):
+        path = tmp_path / "cache-order.json"
+        replay = _publication_collection(has_graph_lowering=False)
+        fresh = _publication_collection(registration_ordinal=1)
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert publish_provenance_collection(replay, str(path)) == "written"
+            cache_document = json.loads(path.read_text(encoding="utf-8"))
+            cache_projection = cache_document["upstreamProjections"][replay.compile_id]
+            assert cache_projection["upstreamJoin"] == "unavailable-cache-replay"
+
+            assert publish_provenance_collection(fresh, str(path)) == "written"
+            fresh_bytes = path.read_bytes()
+            document = json.loads(fresh_bytes)
+            occurrence = next(iter(document["kernelOccurrences"].values()))
+            assert occurrence["registrations"] == [
+                {"alias": "sdsc_fused_mm_0:1", "ordinal": 1}
+            ]
+            assert (
+                document["upstreamProjections"][fresh.compile_id]["upstreamJoin"]
+                == "partial"
+            )
+            assert document["mergeGeneration"] == 2
+
+            assert publish_provenance_collection(replay, str(path)) == "unchanged"
+
+        assert path.read_bytes() == fresh_bytes
+
+    def test_fresh_then_cache_is_a_deterministic_no_op(self, tmp_path):
+        path = tmp_path / "fresh-first.json"
+        fresh = _publication_collection(registration_ordinal=1)
+        replay = _publication_collection(has_graph_lowering=False)
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert publish_provenance_collection(fresh, str(path)) == "written"
+            fresh_bytes = path.read_bytes()
+            assert publish_provenance_collection(replay, str(path)) == "unchanged"
+
+        assert path.read_bytes() == fresh_bytes
+
+    def test_multiple_wrappers_coexist_and_diagnostics_are_idempotent(self, tmp_path):
+        path = tmp_path / "multi-wrapper.json"
+        first = _publication_collection(
+            kernel_name="sdsc_fused_mm_0",
+            handle_id=9,
+            registration_ordinal=1,
+            include_uncollected=True,
+            upstream_projection_failed=True,
+        )
+        second = _publication_collection(
+            kernel_name="sdsc_fused_relu_1",
+            handle_id=10,
+            registration_ordinal=2,
+        )
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert publish_provenance_collection(first, str(path)) == "written"
+            assert publish_provenance_collection(second, str(path)) == "written"
+            before_replay = path.read_bytes()
+            assert publish_provenance_collection(first, str(path)) == "unchanged"
+
+        assert path.read_bytes() == before_replay
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        _SCHEMA_VALIDATOR.validate(document)
+        assert set(document["upstreamProjections"]) == {
+            first.compile_id,
+            second.compile_id,
+        }
+        assert document["diagnostics"] == {
+            "collection-failure": 1,
+            "upstream-projection-failure": 1,
+        }
+        first_projection = document["upstreamProjections"][first.compile_id]
+        assert first_projection["uncollectedKernels"] == ["sdsc_fused_mm_0_uncollected"]
+        assert first_projection["upstreamProjectionFailed"] is True
+        assert document["mergeGeneration"] == 2
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "invalid-json",
+            "invalid-utf8",
+            "unsupported-version",
+            "content-conflict",
+        ],
+    )
+    def test_invalid_or_conflicting_existing_file_is_untouched(self, case, tmp_path):
+        path = tmp_path / "existing.json"
+        collection = _publication_collection(registration_ordinal=1)
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            publish_provenance_collection(collection, str(path))
+
+        if case == "invalid-json":
+            path.write_bytes(b"{not-json")
+        elif case == "invalid-utf8":
+            path.write_bytes(b"\xff")
+        else:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if case == "unsupported-version":
+                document["schemaVersion"] = 2
+            else:
+                handle = next(iter(document["handles"].values()))
+                handle["source"]["file"] = "/conflicting/model.py"
+            path.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        before = path.read_bytes()
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            pytest.raises(ProvenanceArtifactError),
+        ):
+            publish_provenance_collection(collection, str(path))
+
+        assert path.read_bytes() == before
+
+    def test_failed_replace_preserves_existing_and_removes_temporary_file(
+        self, tmp_path
+    ):
+        path = tmp_path / "atomic.json"
+        first = _publication_collection(registration_ordinal=1)
+        second = _publication_collection(
+            kernel_name="sdsc_fused_relu_1",
+            handle_id=10,
+            registration_ordinal=2,
+        )
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            publish_provenance_collection(first, str(path))
+            before = path.read_bytes()
+            with (
+                patch(
+                    "torch_spyre._inductor.provenance_writer.os.replace",
+                    side_effect=OSError("interrupted"),
+                ),
+                pytest.raises(ProvenanceArtifactError, match="atomic.json"),
+            ):
+                publish_provenance_collection(second, str(path))
+
+        assert path.read_bytes() == before
+        assert list(tmp_path.glob(".atomic.json.*.tmp")) == []
+
+    def test_failed_only_and_disabled_contributions_write_nothing(self, tmp_path):
+        builder = ProvenanceCollectionBuilder()
+        builder.add_uncollected_kernel("sdsc_uncollected_0")
+        collection = builder.finish(_registration_state())
+        assert collection is not None
+        path = tmp_path / "absent.json"
+
+        with pytest.raises(ProvenanceArtifactError, match="without a collected"):
+            publish_provenance_collection(collection, str(path))
+        assert not path.exists()
+        assert publish_provenance_collection(collection, None) == "disabled"
+        assert publish_provenance_collection(collection, "") == "disabled"
+        assert not path.exists()
+
+    def test_wait_publication_failure_preserves_runtime_descriptor(self, tmp_path):
+        specs = [_op(_handle(9))]
+        runner = object()
+        compiler = SpyreAsyncCompile()
+        graph = _graph_lowering()
+        configured_path = tmp_path / "private" / "sidecar.json"
+
+        with (
+            V.set_graph_handler(graph),
+            spyre_config.patch({"provenance_artifact_path": str(configured_path)}),
+            patch(
+                "torch_spyre.execution.async_compile.get_output_dir",
+                return_value="/tmp/kernel",
+            ),
+            patch("torch_spyre.execution.async_compile.generate_bundle"),
+            patch("torch_spyre.execution.async_compile.subprocess.run"),
+            patch(
+                "torch_spyre.execution.async_compile.SpyreSDSCKernelRunner",
+                return_value=runner,
+            ) as runner_type,
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
+            patch(
+                "torch_spyre.execution.async_compile.publish_provenance_collection",
+                side_effect=ProvenanceArtifactError("failed to write sidecar.json"),
+            ),
+            patch("torch_spyre.execution.async_compile.logger.warning") as warning,
+        ):
+            result = compiler.sdsc("sdsc_fused_mm_0", specs)
+            compiler.wait({})
+
+        descriptor = runner_type.call_args.kwargs["kernel_provenance"]
+        assert result is runner
+        assert descriptor is not None
+        assert compiler._last_provenance_collection is not None
+        assert warning.call_count == 2
+        assert warning.call_args_list[0].args == (
+            "provenance sidecar publication failed for %s; continuing compilation",
+            "sidecar.json",
+        )
+        assert warning.call_args_list[0].kwargs["exc_info"] is True
+        assert warning.call_args_list[1].args == (
+            "provenance sidecar publication incomplete after %d failure(s) "
+            "across %d compiled Spyre kernels",
+            1,
+            1,
+        )
+        assert str(tmp_path) not in repr(warning.call_args_list)
+
+    def test_failed_temp_write_removes_temporary_file(self, tmp_path):
+        from torch_spyre._inductor import provenance_writer
+
+        path = tmp_path / "write-failure.json"
+        collection = _publication_collection(registration_ordinal=1)
+        real_named_temporary_file = provenance_writer.tempfile.NamedTemporaryFile
+
+        def failing_named_temporary_file(*args, **kwargs):
+            temporary = real_named_temporary_file(*args, **kwargs)
+
+            class FailingTemporaryFile:
+                name = temporary.name
+
+                def __enter__(self):
+                    temporary.__enter__()
+                    return self
+
+                def write(self, payload):
+                    raise OSError("interrupted write")
+
+                def __exit__(self, *exc_info):
+                    return temporary.__exit__(*exc_info)
+
+            return FailingTemporaryFile()
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch(
+                "torch_spyre._inductor.provenance_writer.tempfile.NamedTemporaryFile",
+                side_effect=failing_named_temporary_file,
+            ),
+            pytest.raises(ProvenanceArtifactError, match="write-failure.json"),
+        ):
+            publish_provenance_collection(collection, str(path))
+
+        assert not path.exists()
+        assert list(tmp_path.glob(".write-failure.json.*.tmp")) == []
+
+    def test_disabled_publication_logs_once(self):
+        from torch_spyre.execution import async_compile as async_compile_module
+
+        with (
+            patch.object(
+                async_compile_module,
+                "_publication_disabled_logged",
+                False,
+            ),
+            patch.object(async_compile_module.logger, "debug") as debug,
+        ):
+            async_compile_module._log_publication_disabled_once()
+            async_compile_module._log_publication_disabled_once()
+
+        debug.assert_called_once_with(
+            "Spyre provenance sidecar publication is disabled"
+        )
+
+    def test_level_zero_publication_warns_once_with_enabling_setting(self, tmp_path):
+        from torch_spyre.execution import async_compile as async_compile_module
+
+        path = tmp_path / "level-zero.json"
+        collection = _publication_collection(registration_ordinal=1)
+        compiler = SpyreAsyncCompile()
+        expected_warning = (
+            "Spyre provenance upstream projection is unavailable; set "
+            "torch._inductor.config.trace.provenance_tracking_level=1 "
+            "to enable it"
+        )
+
+        with (
+            spyre_config.patch({"provenance_artifact_path": str(path)}),
+            torch._inductor.config.patch("trace.provenance_tracking_level", 0),
+            patch.object(
+                async_compile_module,
+                "_provenance_level_zero_logged",
+                False,
+            ),
+            patch.object(
+                compiler._artifact_collection_builder,
+                "finish",
+                return_value=collection,
+            ),
+            patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
+            patch.object(async_compile_module.logger, "warning") as warning,
+        ):
+            compiler.wait({})
+            warning.assert_called_once_with(expected_warning)
+            async_compile_module._log_provenance_level_zero_once()
+            warning.assert_called_once_with(expected_warning)
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        projection = document["upstreamProjections"][collection.compile_id]
+        assert projection["upstreamJoin"] == "unavailable-provenance-level-0"
+
+    def test_production_validator_rejects_boolean_integer_constants(self, tmp_path):
+        path = tmp_path / "strict-integers.json"
+        collection = _publication_collection(registration_ordinal=1)
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            publish_provenance_collection(collection, str(path))
+        document = json.loads(path.read_text(encoding="utf-8"))
+
+        for field_path in (
+            ("schemaVersion",),
+            ("eventKey", "version"),
+            ("eventKey", "width"),
+        ):
+            mutated = copy.deepcopy(document)
+            target = mutated
+            for token in field_path[:-1]:
+                target = target[token]
+            target[field_path[-1]] = True
+
+            with pytest.raises(ProvenanceArtifactError):
+                validate_provenance_document(mutated)
+            with pytest.raises(ValidationError):
+                _SCHEMA_VALIDATOR.validate(mutated)
