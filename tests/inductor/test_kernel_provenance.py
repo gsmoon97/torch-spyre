@@ -20,7 +20,10 @@ import dataclasses
 import hashlib
 from importlib.resources import files
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import types
 from unittest.mock import patch
 
@@ -62,6 +65,7 @@ from torch_spyre._inductor.kernel_provenance import (
 from torch_spyre._inductor.profiler_event import (
     extract_kernel_provenance_key,
     format_kernel_provenance_event_name,
+    parse_kernel_provenance_event_name,
 )
 from torch_spyre._inductor.provenance_artifact import (
     collect_kernel_provenance,
@@ -81,6 +85,9 @@ from torch_spyre._inductor.scheduler import SuperDSCScheduling
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
+from torch_spyre.provenance import (
+    resolve_provenance_document,
+)
 
 
 _DEFAULT_PROVENANCE_ARTIFACT_PATH = spyre_config.provenance_artifact_path
@@ -1507,6 +1514,205 @@ class TestProvenanceArtifactSchema:
         occurrence["selector"] = "future-event-occurrence-token"
         _SCHEMA_VALIDATOR.validate(document)
         _validate_fixture_semantics(document)
+
+
+class TestProvenanceArtifactResolver:
+    _EVENT_BASE = "spyre_kernel_v1_fused_linear_relu_atqydvnuutl766na"
+
+    def test_production_codec_preserves_command_step_suffix(self):
+        parsed = parse_kernel_provenance_event_name(f"{self._EVENT_BASE}#007")
+
+        assert parsed is not None
+        assert parsed.base_name == self._EVENT_BASE
+        assert parsed.key == "atqydvnuutl766na"
+        assert parsed.step == 7
+        assert parsed.step_suffix == "#007"
+        assert extract_kernel_provenance_key(parsed.name) == parsed.key
+
+    def test_resolves_lineage_and_reports_occurrence_ambiguity(self):
+        document = _load_provenance_fixture("valid_v1.json")
+
+        result = resolve_provenance_document(f"{self._EVENT_BASE}#3", document)
+
+        assert result["status"] == "partial"
+        assert result["event"]["commandStep"] == 3
+        assert result["event"]["commandStepSuffix"] == "#3"
+        assert result["directHandleIds"] == ["200"]
+        assert result["fusedConstituentIds"] == ["101", "102"]
+        assert set(result["handles"]) == {"101", "102", "200"}
+        assert result["handles"]["101"]["source"]["start_line"] == 17
+        assert result["handles"]["102"]["aten_op"] == "aten.relu.default"
+        assert result["handles"]["200"]["transform_history"][0]["kind"] == ("fusion")
+        assert len(result["occurrences"]) == 2
+        assert result["occurrenceSummary"]["ambiguous"] is True
+        fields = result["occurrenceSummary"]["fields"]
+        assert fields["identityKey"] == {
+            "ambiguous": False,
+            "value": "atqydvnuutl766na",
+        }
+        assert fields["compileId"]["ambiguous"] is True
+        assert {diagnostic["code"] for diagnostic in result["diagnostics"]} == {
+            "ambiguity",
+            "incomplete-artifact",
+            "upstream-join-status",
+        }
+
+    def test_occurrence_selector_is_an_exact_filter(self):
+        document = _load_provenance_fixture("valid_v1.json")
+        for occurrence in document["kernelOccurrences"].values():
+            if occurrence["identityKey"] != "atqydvnuutl766na":
+                continue
+            occurrence["selector"] = (
+                "fresh"
+                if occurrence["compilerKernelName"].endswith("_0")
+                else "level-zero"
+            )
+
+        result = resolve_provenance_document(
+            self._EVENT_BASE,
+            document,
+            occurrence_selector="fresh",
+        )
+
+        assert result["event"]["occurrenceSelector"] == "fresh"
+        assert len(result["occurrences"]) == 1
+        assert result["occurrences"][0]["selector"] == "fresh"
+        assert result["occurrenceSummary"]["ambiguous"] is False
+
+    def test_empty_handle_identity_resolves_without_fallback(self):
+        document = _load_provenance_fixture("valid_v1.json")
+        event_name = "spyre_kernel_v1_fused_unknown_vsancadvtjfcq6cv#0"
+
+        result = resolve_provenance_document(event_name, document)
+
+        assert result["identityKey"] == "vsancadvtjfcq6cv"
+        assert result["directHandleIds"] == []
+        assert result["fusedConstituentIds"] == []
+        assert result["handles"] == {}
+        assert len(result["occurrences"]) == 1
+
+    def test_empty_occurrence_selector_has_distinct_diagnostic(self):
+        result = resolve_provenance_document(
+            self._EVENT_BASE,
+            _load_provenance_fixture("valid_v1.json"),
+            occurrence_selector="",
+        )
+
+        assert result["status"] == "error"
+        assert result["diagnostics"][0]["code"] == "invalid-selector"
+
+    def test_deep_fused_lineage_resolves_without_python_recursion(self):
+        document = _load_provenance_fixture("valid_v1.json")
+        document["handles"]["200"]["fused_from"] = ["201"]
+        for handle_id in range(201, 2201):
+            constituents = [str(handle_id + 1)] if handle_id < 2200 else ["101", "102"]
+            identifier = str(handle_id)
+            document["handles"][identifier] = {
+                "id": identifier,
+                "source": None,
+                "aten_op": None,
+                "ir_chain": [],
+                "fused_from": constituents,
+                "transform_history": [],
+            }
+        document["handles"] = dict(sorted(document["handles"].items()))
+
+        result = resolve_provenance_document(self._EVENT_BASE, document)
+
+        assert result["status"] == "partial"
+        assert len(result["handles"]) == 2003
+        assert result["fusedConstituentIds"][-2:] == ["101", "102"]
+
+    def test_reader_diagnostics_follow_frozen_fixture_manifest(self):
+        manifest = _load_provenance_fixture("fixture_manifest.json")
+
+        for fixture in manifest["invalid"]:
+            document = _load_provenance_fixture(fixture["base"])
+            mutated = _apply_fixture_mutation(document, fixture["mutation"])
+            result = resolve_provenance_document(self._EVENT_BASE, mutated)
+            assert result["status"] == "error", fixture["name"]
+            assert (
+                result["diagnostics"][0]["code"]
+                == (fixture["expectedReaderDiagnostic"])
+            ), fixture["name"]
+
+    def test_missing_key_and_collision_are_distinct(self):
+        document = _load_provenance_fixture("valid_v1.json")
+        missing = resolve_provenance_document(
+            "spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa", document
+        )
+        collision = resolve_provenance_document(
+            "spyre_kernel_v1_fused_relu_atqydvnuutl766na", document
+        )
+
+        assert missing["diagnostics"][0]["code"] == "missing-key"
+        assert collision["diagnostics"][0]["code"] == "collision"
+
+    def test_fresh_process_cli_uses_only_saved_files(self):
+        fixture_path = _PROVENANCE_FIXTURE_DIR / "valid_v1.json"
+        script = (
+            "import sys; import torch; "
+            "before = set(sys.modules); "
+            "from torch_spyre.provenance import main; "
+            "loaded = set(sys.modules) - before; "
+            "assert 'torch_spyre._inductor.provenance_writer' not in loaded; "
+            "assert 'torch_spyre._inductor.kernel_provenance' not in loaded; "
+            "raise SystemExit(main())"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, f"{self._EVENT_BASE}#9", str(fixture_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        result = json.loads(completed.stdout)
+        assert result["event"]["commandStep"] == 9
+        assert result["identityKey"] == "atqydvnuutl766na"
+        assert len(result["occurrences"]) == 2
+
+    def test_documented_module_cli_runs_with_backend_autoload_disabled(self):
+        fixture_path = _PROVENANCE_FIXTURE_DIR / "valid_v1.json"
+        env = dict(os.environ)
+        env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch_spyre.provenance",
+                f"{self._EVENT_BASE}#9",
+                str(fixture_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        result = json.loads(completed.stdout)
+        assert result["event"]["commandStep"] == 9
+        assert result["identityKey"] == "atqydvnuutl766na"
+
+        help_result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch_spyre.provenance",
+                "--help",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert help_result.returncode == 0, help_result.stderr
+        assert (
+            "TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch_spyre.provenance"
+            in help_result.stdout
+        )
 
 
 class TestProvenanceArtifactPublication:

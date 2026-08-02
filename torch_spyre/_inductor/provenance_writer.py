@@ -45,7 +45,12 @@ from torch_spyre.version import __version__ as torch_spyre_version
 
 
 PublicationResult = Literal["disabled", "unchanged", "written"]
-UpstreamJoin = Literal["ok", "partial"]
+UpstreamJoin = Literal[
+    "ok",
+    "partial",
+    "unavailable-cache-replay",
+    "unavailable-provenance-level-0",
+]
 
 _SCHEMA_VERSION = 1
 _UPSTREAM_SOURCE = "inductor_provenance_tracking_node_mappings"
