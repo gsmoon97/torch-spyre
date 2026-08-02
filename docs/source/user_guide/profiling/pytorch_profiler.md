@@ -129,7 +129,17 @@ metadata:
 The key-bearing event name remains the compatibility join for raw traces and
 name-only consumers. The trace does not embed source locations or full
 transformation lineage. Durable source attribution requires pairing it with
-`spyre_provenance.json`, which a separate artifact-publication change writes.
+`spyre_provenance.json`, which Phase 3b writes. Resolve a saved event and
+sidecar with the offline reader:
+
+```shell
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch_spyre.provenance \
+    '<event-name>' /path/to/spyre_provenance.json
+```
+
+Disabling backend autoload is required for this module command because Python
+initializes the `torch_spyre` package before executing the reader. The reader
+uses only the saved event and sidecar and does not import compiler internals.
 
 The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
 key or a cross-machine artifact identifier; source-path, schema, or toolchain

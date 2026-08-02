@@ -37,14 +37,16 @@ from collections.abc import Iterator, Mapping, Sequence
 import sympy
 
 from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, TensorArg
+from torch_spyre.provenance_codec import (
+    KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
+    KERNEL_PROVENANCE_KEY_VERSION,
+)
 
 
 # Version 1 defines the first public finalized-bundle fingerprint as an
 # 80-bit digest prefix. Once published, any canonicalization or width change
 # must bump this version so persisted sidecars are never reinterpreted.
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
-KERNEL_PROVENANCE_KEY_VERSION = 1
-KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 16
 _KERNEL_PROVENANCE_KEY_ALPHABET = frozenset("abcdefghijklmnopqrstuvwxyz234567")
 
 _EXPECTED_OP_SPEC_SCHEMA = {
