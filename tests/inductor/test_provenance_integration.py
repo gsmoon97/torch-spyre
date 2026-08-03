@@ -72,6 +72,67 @@ class _ArtifactModel(torch.nn.Module):
         return torch.relu(x + 1.0)
 
 
+class _GraphBreakArtifactModel(torch.nn.Module):
+    def forward(self, x):
+        y = torch.relu(x + 1.0)
+        torch._dynamo.graph_break()
+        return torch.relu(y + 1.0)
+
+
+class _EquivalentGraphBreakArtifactModel(torch.nn.Module):
+    def _segment(self, x):
+        return torch.relu(x + 1.0)
+
+    def forward(self, x):
+        y = self._segment(x)
+        torch._dynamo.graph_break()
+        return self._segment(y)
+
+
+def _compile_lifecycle_shapes(monkeypatch, tmp_path, model, shapes):
+    import torch_spyre  # noqa: F401
+
+    from torch_spyre._inductor import config as spyre_config
+    from torch_spyre.constants import DEVICE_NAME
+    from torch_spyre.execution.async_compile import SpyreAsyncCompile
+
+    collections = []
+    original_wait = SpyreAsyncCompile.wait
+
+    def capture_wait(compiler, scope):
+        original_wait(compiler, scope)
+        collections.append(compiler._last_provenance_collection)
+
+    monkeypatch.setattr(SpyreAsyncCompile, "wait", capture_wait)
+    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    torch._dynamo.reset()
+
+    path = tmp_path / "spyre_provenance.json"
+    compiled = torch.compile(model.half().to(DEVICE_NAME).eval(), dynamic=False)
+    outputs = []
+    try:
+        with (
+            spyre_config.patch({"provenance_artifact_path": str(path)}),
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            fresh_cache(),
+            torch.no_grad(),
+        ):
+            for shape in shapes:
+                outputs.append(
+                    compiled(
+                        torch.randn(
+                            *shape,
+                            dtype=torch.float16,
+                            device=DEVICE_NAME,
+                        )
+                    )
+                )
+    finally:
+        torch._dynamo.reset()
+
+    return collections, json.loads(path.read_text(encoding="utf-8")), path, outputs
+
+
 def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     """Compile ``model`` on-device and assert the provenance invariants.
 
@@ -205,10 +266,116 @@ def test_handles_survive_real_compile(monkeypatch, model_cls, expect_rewrite):
         prov_logger.setLevel(previous_level)
 
 
+def test_graph_break_merges_distinct_source_segments(monkeypatch, tmp_path):
+    from torch_spyre.provenance import resolve_provenance_event
+
+    collections, document, path, outputs = _compile_lifecycle_shapes(
+        monkeypatch,
+        tmp_path,
+        _GraphBreakArtifactModel(),
+        [(64, 64)],
+    )
+
+    assert [tuple(output.shape) for output in outputs] == [(64, 64)]
+    assert len(collections) == 2
+    assert all(collection is not None for collection in collections)
+    compile_ids = {
+        collection.compile_id for collection in collections if collection is not None
+    }
+    assert len(compile_ids) == 2
+    assert set(document["upstreamProjections"]) == compile_ids
+    assert len(document["kernelIdentities"]) == 2
+    assert len(document["kernelOccurrences"]) == 2
+    assert document["mergeGeneration"] == 2
+    assert document["status"] == "complete"
+
+    for identity in document["kernelIdentities"].values():
+        resolved = resolve_provenance_event(identity["eventNameBase"], path)
+        assert resolved["status"] == "complete"
+        assert len(resolved["occurrences"]) == 1
+
+
+def test_graph_break_equivalent_source_segments_merge_context(
+    monkeypatch, tmp_path, caplog
+):
+    from torch_spyre.provenance import resolve_provenance_event
+
+    caplog.set_level(logging.WARNING)
+    collections, document, path, outputs = _compile_lifecycle_shapes(
+        monkeypatch,
+        tmp_path,
+        _EquivalentGraphBreakArtifactModel(),
+        [(64, 64)],
+    )
+
+    assert [tuple(output.shape) for output in outputs] == [(64, 64)]
+    assert not any(
+        "provenance sidecar publication" in record.getMessage()
+        for record in caplog.records
+    )
+
+    assert len(collections) == 2
+    assert all(collection is not None for collection in collections)
+    compile_ids = {
+        collection.compile_id for collection in collections if collection is not None
+    }
+    assert len(compile_ids) == 1
+    assert set(document["upstreamProjections"]) == compile_ids
+    assert len(document["kernelIdentities"]) == 1
+    assert len(document["kernelOccurrences"]) == 1
+    assert document["mergeGeneration"] == 2
+    assert document["status"] == "complete"
+    projection = next(iter(document["upstreamProjections"].values()))
+    stack_context = next(iter(projection["kernelStackTraces"].values()))
+    stack_traces = stack_context["stackTraces"]
+    assert any("y = self._segment(x)" in trace for trace in stack_traces)
+    assert any("return self._segment(y)" in trace for trace in stack_traces)
+    assert projection["upstreamProjectionFailed"] is False
+    assert document["diagnostics"] == {}
+
+    identity = next(iter(document["kernelIdentities"].values()))
+    resolved = resolve_provenance_event(identity["eventNameBase"], path)
+    assert resolved["status"] == "complete"
+    assert len(resolved["occurrences"]) == 1
+
+
+def test_shape_recompile_merges_distinct_compiles(monkeypatch, tmp_path):
+    from torch_spyre.provenance import resolve_provenance_event
+
+    collections, document, path, outputs = _compile_lifecycle_shapes(
+        monkeypatch,
+        tmp_path,
+        _ArtifactModel(),
+        [(64, 64), (128, 64)],
+    )
+
+    assert [tuple(output.shape) for output in outputs] == [
+        (64, 64),
+        (128, 64),
+    ]
+    assert len(collections) == 2
+    assert all(collection is not None for collection in collections)
+    compile_ids = {
+        collection.compile_id for collection in collections if collection is not None
+    }
+    assert len(compile_ids) == 2
+    assert set(document["upstreamProjections"]) == compile_ids
+    assert len(document["kernelIdentities"]) == 2
+    assert len(document["kernelOccurrences"]) == 2
+    assert document["mergeGeneration"] == 2
+    assert document["status"] == "complete"
+
+    for identity in document["kernelIdentities"].values():
+        resolved = resolve_provenance_event(identity["eventNameBase"], path)
+        assert resolved["status"] == "complete"
+        assert len(resolved["occurrences"]) == 1
+
+
 def test_artifact_collection_joins_fresh_aliases_and_survives_cache_replay(
     monkeypatch,
     tmp_path,
 ):
+    torch._dynamo.reset()
     monkeypatch.delenv("TORCH_TRACE", raising=False)
     import torch_spyre  # noqa: F401
 
