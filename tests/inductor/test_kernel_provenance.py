@@ -14,6 +14,7 @@
 
 """Device-free tests for kernel provenance identity and event transport."""
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import ctypes
 import dataclasses
@@ -75,6 +76,7 @@ from torch_spyre._inductor.provenance_artifact import (
     record_kernel_registration,
 )
 from torch_spyre._inductor.provenance_writer import (
+    CapturedUpstreamProjection,
     capture_upstream_projection,
     ProvenanceArtifactError,
     publish_provenance_collection,
@@ -2000,6 +2002,172 @@ class TestProvenanceArtifactPublication:
         first_projection = document["upstreamProjections"][first.compile_id]
         assert first_projection["uncollectedKernels"] == ["sdsc_fused_mm_0_uncollected"]
         assert first_projection["upstreamProjectionFailed"] is True
+        assert document["mergeGeneration"] == 2
+
+    def test_concurrent_publications_merge_without_lost_updates(self, tmp_path):
+        collections = [
+            _publication_collection(
+                kernel_name=f"sdsc_fused_mm_{index}",
+                handle_id=100 + index,
+                registration_ordinal=index + 1,
+            )
+            for index in range(8)
+        ]
+
+        def publish_all(path):
+            with ThreadPoolExecutor(max_workers=len(collections)) as executor:
+                return list(
+                    executor.map(
+                        lambda collection: publish_provenance_collection(
+                            collection, str(path)
+                        ),
+                        collections,
+                    )
+                )
+
+        first_path = tmp_path / "concurrent-first.json"
+        second_path = tmp_path / "concurrent-second.json"
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch("torch_spyre._inductor.provenance_writer.trace_structured_artifact"),
+        ):
+            assert publish_all(first_path) == ["written"] * len(collections)
+            assert publish_all(second_path) == ["written"] * len(collections)
+
+        assert first_path.read_bytes() == second_path.read_bytes()
+        document = json.loads(first_path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        _SCHEMA_VALIDATOR.validate(document)
+        assert document["mergeGeneration"] == len(collections)
+        assert set(document["upstreamProjections"]) == {
+            collection.compile_id for collection in collections
+        }
+        assert len(document["kernelOccurrences"]) == len(collections)
+
+    def test_complete_projection_survives_later_partial_contribution(self, tmp_path):
+        path = tmp_path / "rich-then-partial.json"
+        collection = _publication_collection(registration_ordinal=1)
+        alias = "sdsc_fused_mm_0:1"
+        complete = CapturedUpstreamProjection(
+            upstream_join="ok",
+            pre_to_post={"pre": ("post",)},
+            post_to_pre={"post": ("pre",)},
+            cpp_code_to_post={alias: ("post",)},
+            post_to_cpp_code={"post": (alias,)},
+            kernel_stack_traces={
+                alias: {
+                    "stackTraces": ("model.py:10",),
+                    "postGradNodes": ("post",),
+                    "preGradNodes": ("pre",),
+                }
+            },
+            failed=False,
+        )
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert (
+                publish_provenance_collection(
+                    collection,
+                    str(path),
+                    upstream_projection=complete,
+                )
+                == "written"
+            )
+            rich_document = json.loads(path.read_text(encoding="utf-8"))
+            rich_projection = copy.deepcopy(
+                rich_document["upstreamProjections"][collection.compile_id]
+            )
+            assert (
+                publish_provenance_collection(
+                    collection,
+                    str(path),
+                    upstream_projection_failed=True,
+                )
+                == "written"
+            )
+            partial_bytes = path.read_bytes()
+            assert (
+                publish_provenance_collection(
+                    collection,
+                    str(path),
+                    upstream_projection_failed=True,
+                )
+                == "unchanged"
+            )
+
+        assert path.read_bytes() == partial_bytes
+        document = json.loads(partial_bytes)
+        projection = document["upstreamProjections"][collection.compile_id]
+        for field in (
+            "preToPost",
+            "postToPre",
+            "cppCodeToPost",
+            "postToCppCode",
+            "kernelStackTraces",
+        ):
+            assert projection[field] == rich_projection[field]
+        assert projection["upstreamJoin"] == "ok"
+        assert projection["upstreamProjectionFailed"] is True
+        assert document["diagnostics"] == {"upstream-projection-failure": 1}
+        assert document["status"] == "partial"
+        assert document["mergeGeneration"] == 2
+
+    def test_complete_projections_union_additive_stack_context(self, tmp_path):
+        path = tmp_path / "complete-context-union.json"
+        collection = _publication_collection(registration_ordinal=1)
+        alias = "sdsc_fused_mm_0:1"
+        first = CapturedUpstreamProjection(
+            upstream_join="ok",
+            pre_to_post={"pre": ("post",)},
+            post_to_pre={"post": ("pre",)},
+            cpp_code_to_post={alias: ("post",)},
+            post_to_cpp_code={"post": (alias,)},
+            kernel_stack_traces={
+                alias: {
+                    "stackTraces": ("model.py:10",),
+                    "postGradNodes": ("post",),
+                    "preGradNodes": ("pre",),
+                }
+            },
+            failed=False,
+        )
+        second = dataclasses.replace(
+            first,
+            kernel_stack_traces={
+                alias: {
+                    "stackTraces": ("model.py:20",),
+                    "postGradNodes": ("post",),
+                    "preGradNodes": ("pre",),
+                }
+            },
+        )
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert (
+                publish_provenance_collection(
+                    collection, str(path), upstream_projection=first
+                )
+                == "written"
+            )
+            assert (
+                publish_provenance_collection(
+                    collection, str(path), upstream_projection=second
+                )
+                == "written"
+            )
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        _SCHEMA_VALIDATOR.validate(document)
+        projection = document["upstreamProjections"][collection.compile_id]
+        assert projection["kernelStackTraces"][alias]["stackTraces"] == [
+            "model.py:10",
+            "model.py:20",
+        ]
+        assert projection["upstreamJoin"] == "ok"
+        assert projection["upstreamProjectionFailed"] is False
+        assert document["diagnostics"] == {}
+        assert document["status"] == "complete"
         assert document["mergeGeneration"] == 2
 
     @pytest.mark.parametrize(

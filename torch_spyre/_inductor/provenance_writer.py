@@ -597,29 +597,16 @@ def _merge_projections(destination_value: object, incoming_value: object) -> Non
             raise ProvenanceArtifactError(
                 f"conflicting upstream join status for key {compile_id}"
             )
-        if existing["upstreamJoin"] == "ok":
-            if any(
-                existing[field] != projection[field]
-                for field in (
-                    "preToPost",
-                    "postToPre",
-                    "cppCodeToPost",
-                    "postToCppCode",
-                    "kernelStackTraces",
-                )
-            ):
-                raise ProvenanceArtifactError(
-                    f"conflicting complete upstream projection for key {compile_id}"
-                )
-            existing["uncollectedKernels"] = uncollected_kernels
-            existing["upstreamProjectionFailed"] = upstream_projection_failed
-            continue
-        _merge_partial_projection(existing, projection)
+        # Equivalent wrappers can be compiled from different source call sites.
+        # Their graph relations and stack contexts are additive even when both
+        # captures are complete, so merge them instead of treating inequality as
+        # a content conflict.
+        _merge_projection_content(existing, projection)
         existing["uncollectedKernels"] = uncollected_kernels
         existing["upstreamProjectionFailed"] = upstream_projection_failed
 
 
-def _merge_partial_projection(
+def _merge_projection_content(
     destination: dict[str, Any], incoming: Mapping[str, object]
 ) -> None:
     for field in ("preToPost", "cppCodeToPost"):
