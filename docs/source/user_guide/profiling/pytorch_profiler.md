@@ -114,12 +114,18 @@ The name describes bundle-level attribution:
 - A valid bundle with no handles still receives a key and uses
   `fused_unknown` as its display summary.
 
-Phase 3a places only the join key in the trace. The trace alone cannot map that
-key back to handles or source. Phase 3b will persist that mapping in the
-`spyre_provenance.json` sidecar; consumers must pair the trace with that
-artifact for durable source attribution. Native Kineto
-`args.debug_handles` metadata is planned as an additive PyTorch 2.12 path, with
-the v1 name retained for compatibility.
+For compiler-prepared provenance events, Kineto also carries structured
+metadata:
+
+- `args.provenance_key` is the 16-character join key as a string.
+- `args.debug_handles` is a JSON array of directly attached handle IDs. The
+  IDs are strings, and JavaScript consumers must keep them as strings rather
+  than coercing them to numbers.
+
+The key-bearing event name remains the compatibility join for raw traces and
+name-only consumers. The trace does not embed source locations or full
+transformation lineage. Durable source attribution requires pairing it with
+`spyre_provenance.json`, which a separate artifact-publication change writes.
 
 The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
 key or a cross-machine artifact identifier; source-path, schema, or toolchain
