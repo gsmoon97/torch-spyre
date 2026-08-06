@@ -219,10 +219,7 @@ def test_synchronize_callable():
 
 @pytest.mark.requires_spyre_profiler
 def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
-    """Real event keys match compiler handles captured in the same process.
-
-    Phase 3b will persist this out-of-band mapping as the provenance sidecar.
-    """
+    """Real events carry compiler keys and direct handles from the same process."""
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
     from torch_spyre._inductor.profiler_event import (
         AIUPTI_ACTIVITY_NAME_MAX_BYTES,
@@ -305,6 +302,15 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
             len(event["name"].encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
             for event in matching_events
         )
+        for event in matching_events:
+            args = event.get("args", {})
+            assert args.get("provenance_key") == descriptor.key
+            debug_handles = args.get("debug_handles")
+            assert isinstance(debug_handles, list), (
+                "args.debug_handles must be a JSON array, not a quoted string"
+            )
+            assert all(isinstance(handle_id, str) for handle_id in debug_handles)
+            assert debug_handles == list(descriptor.debug_handle_ids)
 
     def lineage(handle):
         yield handle
@@ -339,10 +345,6 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     assert any(
         len(handle.fused_from) >= 2 for _, _, handles in captures for handle in handles
     ), "the compiled kernel did not retain its fused provenance constituents"
-
-    # TODO(PyTorch 2.12): additionally assert that each matching event carries
-    # args.debug_handles equal to descriptor.debug_handle_ids. The event-name
-    # key remains the shared compatibility join and must continue to pass.
 
 
 @pytest.mark.requires_spyre_profiler

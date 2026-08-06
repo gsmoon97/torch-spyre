@@ -367,9 +367,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
            std::to_string(step_idx);
   }
 
-  // TODO(PyTorch 2.12): retain this name as the raw-trace compatibility join
-  // when the registered PrivateUse1 profiler also emits structured
-  // debug_handles metadata for the same kernel provenance key.
+  // Retain the key-bearing name as the raw-trace compatibility join alongside
+  // the registered PrivateUse1 profiler's structured provenance metadata.
 
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in

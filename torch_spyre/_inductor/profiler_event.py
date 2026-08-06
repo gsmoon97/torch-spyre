@@ -111,8 +111,5 @@ def _sanitize_component(value: str) -> str:
     return sanitized or "unknown"
 
 
-# TODO(PyTorch 2.12): register key -> debug_handle_ids with the out-of-tree
-# PrivateUse1 activity profiler and emit directly attached IDs as Kineto metadata.
-# The kernel descriptor and event-name contract are shared by PyTorch 2.11 and
-# 2.12; structured metadata is additive, and the name remains the compatibility
-# join.
+# The event name remains the compatibility join for raw traces and name-only
+# consumers even when Kineto also carries structured provenance metadata.

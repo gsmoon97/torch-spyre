@@ -13,7 +13,11 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import launch_jobplan, prepare_kernel
+from torch_spyre._C import (
+    launch_jobplan,
+    prepare_kernel,
+    register_kernel_provenance,
+)
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.kernel_provenance import KernelProvenanceDescriptor
 from torch_spyre._inductor.profiler_event import (
@@ -51,15 +55,22 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.kernel_provenance = kernel_provenance
-        self.profiler_event_name = (
-            format_kernel_provenance_event_name(kernel_provenance)
-            if kernel_provenance is not None
-            else None
-        )
+        self.profiler_event_name: str | None
         spyrecode_dir = code_dir + "/spyreCodeDir"
-        if self.profiler_event_name is None:
+        if kernel_provenance is None:
+            self.profiler_event_name = None
             self.jobplan = prepare_kernel(spyrecode_dir)
         else:
+            self.profiler_event_name = format_kernel_provenance_event_name(
+                kernel_provenance
+            )
+            # Rejection is intentionally fail-open: C++ warns and counts
+            # conflicts while the key-bearing name remains the compatibility
+            # join.
+            register_kernel_provenance(
+                self.profiler_event_name,
+                list(kernel_provenance.debug_handle_ids),
+            )
             self.jobplan = prepare_kernel(
                 spyrecode_dir,
                 profiler_name=self.profiler_event_name,

@@ -21,6 +21,7 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 
 #ifdef USE_SPYRE_CCL
 #include <pybind11/chrono.h>
@@ -199,6 +201,34 @@ PYBIND11_MODULE(_C, m) {
   m.doc() = "Spyre C++ bindings";
   m.attr("AIUPTI_ACTIVITY_NAME_MAX_BYTES") =
       py::int_(spyre::kAIUptiActivityNameMaxBytes);
+  m.def("register_kernel_provenance", &spyre::registerKernelProvenance,
+        py::arg("event_base_name"), py::arg("debug_handle_ids"),
+        "Register direct debug-handle IDs for a provenance-aware event name");
+  m.def(
+      "lookup_kernel_provenance",
+      [](const std::string& key) -> py::object {
+        const auto ids = spyre::lookupKernelProvenance(key);
+        if (ids == nullptr) {
+          return py::none();
+        }
+        return py::cast(*ids);
+      },
+      py::arg("key"), "Return registered debug-handle IDs without mutation");
+  m.def(
+      "kernel_provenance_registry_stats",
+      []() {
+        const auto stats = spyre::kernelProvenanceRegistryStats();
+        py::dict result;
+        result["entries"] = stats.entries;
+        result["hits"] = stats.hits;
+        result["misses"] = stats.misses;
+        result["conflicts"] = stats.conflicts;
+        return result;
+      },
+      "Return process-lifetime kernel provenance registry counters");
+  m.def("extract_kernel_provenance_key", &spyre::extractKernelProvenanceKey,
+        py::arg("event_name"),
+        "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);

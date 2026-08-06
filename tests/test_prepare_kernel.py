@@ -14,7 +14,9 @@
 
 """Tests for PrepareKernel Python bindings and JobPlan verification."""
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -24,7 +26,7 @@ import torch
 import torch_spyre
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def initialize_runtime():
     """Initialize Spyre runtime before running tests."""
     # Initialize torch with spyre device to start runtime
@@ -33,6 +35,61 @@ def initialize_runtime():
     # Runtime cleanup happens automatically
 
 
+@pytest.fixture
+def registry_key(request):
+    """Derive a reproducible canonical key from the current test node."""
+    digest = hashlib.sha256(request.node.nodeid.encode("utf-8")).digest()[:10]
+    return base64.b32encode(digest).decode("ascii").lower()
+
+
+def _registry_event_name(key):
+    return f"spyre_kernel_v1_registry_test_{key}"
+
+
+def test_kernel_provenance_registry_insert_and_duplicate(registry_key):
+    event_name = _registry_event_name(registry_key)
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_insert = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_insert["entries"] == before["entries"] + 1
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_duplicate = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_duplicate["entries"] == after_insert["entries"]
+    assert after_duplicate["conflicts"] == after_insert["conflicts"]
+    before_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["11", "12"]
+    after_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_lookup["hits"] == before_lookup["hits"] + 1
+
+
+def test_kernel_provenance_registry_rejects_conflict_without_overwrite(registry_key):
+    event_name = _registry_event_name(registry_key)
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["21"])
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert not torch_spyre._C.register_kernel_provenance(event_name, ["22"])
+
+    after = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after["entries"] == before["entries"]
+    assert after["conflicts"] == before["conflicts"] + 1
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["21"]
+
+
+def test_kernel_provenance_registry_miss_and_unparseable_name(registry_key):
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) is None
+    after_miss = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_miss["misses"] == before["misses"] + 1
+
+    assert not torch_spyre._C.register_kernel_provenance("not_an_event", ["31"])
+    after_invalid = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_invalid["entries"] == after_miss["entries"]
+    assert after_invalid["conflicts"] == after_miss["conflicts"]
+
+
+@pytest.mark.usefixtures("initialize_runtime")
 class TestPrepareKernel:
     """Test suite for PrepareKernel and JobPlan bindings."""
 

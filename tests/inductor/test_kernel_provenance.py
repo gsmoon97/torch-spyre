@@ -25,7 +25,11 @@ import torch  # noqa: F401
 from sympy import Integer, Symbol, sympify
 from torch._inductor.utils import IndentedBuffer
 
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import (
+    DataFormats,
+    ElementArrangement,
+    extract_kernel_provenance_key as extract_kernel_provenance_key_cpp,
+)
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -499,25 +503,32 @@ class TestKernelProvenanceEventName:
         with pytest.raises(ValueError, match="not canonical lowercase base32"):
             KernelProvenanceDescriptor(key, (), ())
 
-    def test_accepts_supported_version_and_rejects_other_names(self):
-        key = "a" * KERNEL_PROVENANCE_KEY_BASE32_WIDTH
-        valid_name = f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{key}#17"
-        assert extract_kernel_provenance_key(valid_name) == key
-        assert extract_kernel_provenance_key("sdsc_mm_0") is None
-        assert extract_kernel_provenance_key(f"spyre_kernel_fused_mm_{key}") is None
-        assert extract_kernel_provenance_key(f"spyre_kernel_v2_fused_mm_{key}") is None
-        assert (
-            extract_kernel_provenance_key(
-                f"spyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_short"
-            )
-            is None
-        )
-        assert (
-            extract_kernel_provenance_key(
-                f"xspyre_kernel_v{KERNEL_PROVENANCE_KEY_VERSION}_fused_mm_{key}"
-            )
-            is None
-        )
+    def test_cpp_parser_literals_match_python_constants(self):
+        """The C++ parser hardcodes these; see kernel_provenance_registry.cpp.
+
+        A constant bump must update both sides in the same change.
+        """
+        assert KERNEL_PROVENANCE_KEY_VERSION == 1
+        assert KERNEL_PROVENANCE_KEY_BASE32_WIDTH == 16
+
+    @pytest.mark.parametrize(
+        ("event_name", "expected"),
+        [
+            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa", "a" * 16),
+            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#17", "a" * 16),
+            ("sdsc_mm_0", None),
+            ("spyre_kernel_fused_mm_aaaaaaaaaaaaaaaa", None),
+            ("spyre_kernel_v2_fused_mm_aaaaaaaaaaaaaaaa", None),
+            ("spyre_kernel_v1_fused_mm_short", None),
+            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaa", None),
+            ("spyre_kernel_v1_fused_mmaaaaaaaaaaaaaaaa", None),
+            ("spyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa#step", None),
+            ("xspyre_kernel_v1_fused_mm_aaaaaaaaaaaaaaaa", None),
+        ],
+    )
+    def test_python_and_cpp_key_parsers_share_contract(self, event_name, expected):
+        assert extract_kernel_provenance_key(event_name) == expected
+        assert extract_kernel_provenance_key_cpp(event_name) == expected
 
 
 class TestKernelProvenancePropagation:
@@ -609,10 +620,16 @@ class TestKernelProvenancePropagation:
         descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
         assert descriptor is not None
 
-        with patch(
-            "torch_spyre.execution.kernel_runner.prepare_kernel",
-            return_value="jobplan",
-        ) as prepare_kernel:
+        with (
+            patch(
+                "torch_spyre.execution.kernel_runner.register_kernel_provenance",
+                return_value=True,
+            ) as register_kernel_provenance,
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ) as prepare_kernel,
+        ):
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
@@ -622,18 +639,27 @@ class TestKernelProvenancePropagation:
         assert runner.kernel_provenance is descriptor
         assert runner.profiler_event_name == _event_name(descriptor)
         assert runner.jobplan == "jobplan"
+        register_kernel_provenance.assert_called_once_with(
+            _event_name(descriptor), list(descriptor.debug_handle_ids)
+        )
         prepare_kernel.assert_called_once_with(
             "/tmp/kernel/spyreCodeDir",
             profiler_name=_event_name(descriptor),
         )
 
     def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
-        with patch(
-            "torch_spyre.execution.kernel_runner.prepare_kernel",
-            return_value="jobplan",
-        ) as prepare_kernel:
+        with (
+            patch(
+                "torch_spyre.execution.kernel_runner.register_kernel_provenance"
+            ) as register_kernel_provenance,
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ) as prepare_kernel,
+        ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
 
         assert runner.kernel_provenance is None
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
+        register_kernel_provenance.assert_not_called()

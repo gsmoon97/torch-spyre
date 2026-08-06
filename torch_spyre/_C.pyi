@@ -29,13 +29,17 @@ __all__: list[str] = [
     "copy_tensor",
     "fill_tensor",
     "encode_constant",
+    "extract_kernel_provenance_key",
     "free_runtime",
     "get_device_dtype",
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "kernel_provenance_registry_stats",
     "launch_jobplan",
+    "lookup_kernel_provenance",
     "prepare_kernel",
+    "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
@@ -44,6 +48,13 @@ __all__: list[str] = [
 ]
 
 AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
+
+def extract_kernel_provenance_key(event_name: str) -> str | None: ...
+def kernel_provenance_registry_stats() -> dict[str, int]: ...
+def lookup_kernel_provenance(key: str) -> list[str] | None: ...
+def register_kernel_provenance(
+    event_base_name: str, debug_handle_ids: collections.abc.Sequence[str]
+) -> bool: ...
 
 class DataFormats:
     """
