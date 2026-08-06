@@ -66,9 +66,9 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "device_size": "list[int]",
     "device_coordinates": "list[Expr]",
     "allocation": "Any",
-    "per_tile_fixed": "bool",
     "name": "str | None",
     "device_tile_advance_expr": "Expr | None",
+    "element_arrangement": "ElementArrangement",
 }
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
@@ -263,9 +263,9 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         "device_size": _canonical_value(arg.device_size),
         "device_coordinates": _canonical_value(arg.device_coordinates),
         "allocation": _canonical_value(arg.allocation),
-        "per_tile_fixed": arg.per_tile_fixed,
         "name": arg.name,
         "device_tile_advance_expr": _canonical_value(arg.device_tile_advance_expr),
+        "element_arrangement": arg.element_arrangement.name,
     }
 
 
