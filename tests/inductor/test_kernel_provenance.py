@@ -25,7 +25,7 @@ import torch  # noqa: F401
 from sympy import Integer, Symbol, sympify
 from torch._inductor.utils import IndentedBuffer
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     IndirectAccess,
@@ -118,6 +118,7 @@ def _generated_wrapper_roundtrip(specs):
     namespace = {
         "DataFormats": DataFormats,
         "DebugHandle": DebugHandle,
+        "ElementArrangement": ElementArrangement,
         "IndirectAccess": IndirectAccess,
         "LoopSpec": LoopSpec,
         "OpSpec": OpSpec,
@@ -226,16 +227,27 @@ class TestKernelProvenanceDescriptor:
             first,
             args=[dataclasses.replace(arg, device_size=[4, 64])],
         )
+        changed_arrangement = dataclasses.replace(
+            first,
+            args=[
+                dataclasses.replace(arg, element_arrangement=ElementArrangement.EXX2)
+            ],
+        )
 
         first_descriptor = build_kernel_provenance_descriptor([first])
         reordered_descriptor = build_kernel_provenance_descriptor([reordered_metadata])
         changed_descriptor = build_kernel_provenance_descriptor([changed_shape])
+        changed_arrangement_descriptor = build_kernel_provenance_descriptor(
+            [changed_arrangement]
+        )
 
         assert first_descriptor is not None
         assert reordered_descriptor is not None
         assert changed_descriptor is not None
+        assert changed_arrangement_descriptor is not None
         assert reordered_descriptor.key == first_descriptor.key
         assert changed_descriptor.key != first_descriptor.key
+        assert changed_arrangement_descriptor.key != first_descriptor.key
 
     def test_pins_rich_canonical_bundle_key(self):
         c0 = Symbol("c0")
@@ -249,7 +261,7 @@ class TestKernelProvenanceDescriptor:
             device_size=[2, 64],
             device_coordinates=[IndirectAccess(index), c0],
             allocation={"hbm_pool": {"offset": 4096}},
-            per_tile_fixed=True,
+            element_arrangement=ElementArrangement.EXX2,
             name="arg0",
             device_tile_advance_expr=64 * c0,
         )
@@ -278,7 +290,7 @@ class TestKernelProvenanceDescriptor:
             "aten.mm.default",
             "aten.permute.default",
         )
-        assert descriptor.key == "atqydvnuutl766na"
+        assert descriptor.key == "2y3kqixggcejkcas"
 
     def test_generated_wrapper_roundtrip_reproduces_descriptor(self):
         constituent = _handle(8, aten_op="aten.permute.default")
@@ -291,6 +303,7 @@ class TestKernelProvenanceDescriptor:
             device_size=[2, 64],
             device_coordinates=[Integer(0), c0],
             allocation={"hbm": 0},
+            element_arrangement=ElementArrangement.DL16_TO_FP32,
             name="arg0",
         )
         specs = [
