@@ -1517,6 +1517,24 @@ class TestProvenanceArtifactSchema:
         _SCHEMA_VALIDATOR.validate(document)
         _validate_fixture_semantics(document)
 
+    def test_shipped_package_avoids_internal_project_labels(self):
+        package_root = Path(__file__).parents[2] / "torch_spyre"
+        internal_label = re.compile(
+            r"\b(?:phase\s+(?:[0-9]+[a-z]|x)|milestone\s+[0-9]+|internship)\b",
+            re.IGNORECASE,
+        )
+        source_suffixes = {".cpp", ".h", ".json", ".py", ".pyi"}
+        offenders = {}
+
+        for path in package_root.rglob("*"):
+            if path.suffix not in source_suffixes:
+                continue
+            matches = internal_label.findall(path.read_text(encoding="utf-8"))
+            if matches:
+                offenders[str(path.relative_to(package_root))] = matches
+
+        assert offenders == {}
+
 
 class TestProvenanceArtifactResolver:
     _EVENT_BASE = "spyre_kernel_v1_fused_linear_relu_atqydvnuutl766na"

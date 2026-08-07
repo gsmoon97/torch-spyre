@@ -22,7 +22,7 @@
       "const": 1
     },
     "eventKey": {
-      "description": "Phase 3a profiler event-key contract shared by every identity in this artifact.",
+      "description": "Versioned profiler event-key contract shared by every kernel identity in this artifact.",
       "$ref": "#/$defs/eventKey"
     },
     "mergeGeneration": {
@@ -58,7 +58,7 @@
       "additionalProperties": { "$ref": "#/$defs/handle" }
     },
     "kernelIdentities": {
-      "description": "Content identities keyed by the Phase 3a finalized-bundle key.",
+      "description": "Content identities keyed by the finalized-bundle provenance key.",
       "type": "object",
       "minProperties": 1,
       "propertyNames": { "$ref": "#/$defs/eventKeyValue" },
@@ -86,7 +86,7 @@
       "pattern": "^(0|[1-9][0-9]*)$"
     },
     "eventKeyValue": {
-      "description": "Lowercase base32 encoding of the first 80 bits of the Phase 3a SHA-256 bundle fingerprint.",
+      "description": "Lowercase base32 encoding of the first 80 bits of the SHA-256 finalized-bundle fingerprint.",
       "type": "string",
       "pattern": "^[a-z2-7]{16}$"
     },
@@ -311,7 +311,7 @@
           "$ref": "#/$defs/stringSet"
         },
         "eventNameBase": {
-          "description": "Exact Phase 3a profiler event name before the runtime appends #<step>.",
+          "description": "Exact profiler event name before the runtime appends #<step>.",
           "type": "string",
           "pattern": "^spyre_kernel_v1_[A-Za-z0-9_]+_[a-z2-7]{16}$"
         }
@@ -366,7 +366,7 @@
           "uniqueItems": true
         },
         "selector": {
-          "description": "Reserved opaque exact-match occurrence token supplied by future event metadata. V1 writers omit it.",
+          "description": "Reserved optional opaque exact-match occurrence token supplied by runtime event metadata. V1 writers omit this field.",
           "type": "string",
           "minLength": 1
         }
