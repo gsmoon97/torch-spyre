@@ -17,14 +17,16 @@
 #include "kernel_provenance_registry.h"
 
 #include <c10/util/Exception.h>
-#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <shared_mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace spyre {
 namespace {
@@ -35,14 +37,12 @@ constexpr std::string_view kEventNamePrefix = "spyre_kernel_v1_";
 constexpr size_t kKeyWidth = 16;
 
 bool isDisplayCharacter(char value) {
-  return (value >= 'A' && value <= 'Z') ||
-      (value >= 'a' && value <= 'z') ||
-      (value >= '0' && value <= '9') || value == '_';
+  return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+         (value >= '0' && value <= '9') || value == '_';
 }
 
 bool isKeyCharacter(char value) {
-  return (value >= 'a' && value <= 'z') ||
-      (value >= '2' && value <= '7');
+  return (value >= 'a' && value <= 'z') || (value >= '2' && value <= '7');
 }
 
 bool isDecimalCharacter(char value) {
@@ -111,9 +111,8 @@ std::optional<std::string> extractKernelProvenanceKey(
   return std::string(key);
 }
 
-bool registerKernelProvenance(
-    const std::string& event_base_name,
-    std::vector<std::string> debug_handle_ids) {
+bool registerKernelProvenance(const std::string& event_base_name,
+                              std::vector<std::string> debug_handle_ids) {
   const auto key = extractKernelProvenanceKey(event_base_name);
   if (!key.has_value()) {
     TORCH_WARN_ONCE(
@@ -135,16 +134,14 @@ bool registerKernelProvenance(
   }
 
   state.conflicts.fetch_add(1, std::memory_order_relaxed);
-  TORCH_WARN_ONCE(
-      "Conflicting Spyre kernel provenance registration for key ", *key,
-      "; preserving the first debug-handle mapping ",
-      nlohmann::json(existing->second).dump(), " and rejecting ",
-      nlohmann::json(debug_handle_ids).dump());
+  TORCH_WARN_ONCE("Conflicting Spyre kernel provenance registration for key ",
+                  *key, "; preserving the first debug-handle mapping ",
+                  nlohmann::json(existing->second).dump(), " and rejecting ",
+                  nlohmann::json(debug_handle_ids).dump());
   return false;
 }
 
-const std::vector<std::string>* lookupKernelProvenance(
-    const std::string& key) {
+const std::vector<std::string>* lookupKernelProvenance(const std::string& key) {
   auto& state = registryState();
   std::shared_lock<std::shared_mutex> lock(state.mutex);
   const auto entry = state.entries.find(key);

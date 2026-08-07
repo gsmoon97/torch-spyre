@@ -50,13 +50,13 @@ std::optional<std::string> extractKernelProvenanceKey(
  * Returns true for an insertion or identical duplicate, and false for an
  * invalid event name or a conflicting registration.
  */
-bool registerKernelProvenance(
-    const std::string& event_base_name,
-    std::vector<std::string> debug_handle_ids);
+bool registerKernelProvenance(const std::string& event_base_name,
+                              std::vector<std::string> debug_handle_ids);
 
 /**
  * Return a process-lifetime handle list, or nullptr when none is registered.
- * Insert-only storage keeps the returned pointer valid after the lock is released.
+ * Insert-only storage keeps the returned pointer valid after the lock is
+ * released.
  */
 const std::vector<std::string>* lookupKernelProvenance(const std::string& key);
 
