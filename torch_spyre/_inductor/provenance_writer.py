@@ -91,11 +91,15 @@ _PROJECTION_KEYS = {
     "postToCppCode",
     "kernelStackTraces",
 }
+# Prefer the most actionable evidence when v1's scalar join status must summarize
+# several equivalent contributions. A level-one cache replay outranks a level-zero
+# fresh compile because obtaining the missing mapping then requires a fresh
+# level-one compile; v2 should preserve every observed reason instead.
 _JOIN_RANK = {
     "unavailable-provenance-level-0": 0,
-    "unavailable-cache-replay": 0,
-    "partial": 1,
-    "ok": 2,
+    "unavailable-cache-replay": 1,
+    "partial": 2,
+    "ok": 3,
 }
 _TRANSFORM_KINDS = {"rewrite", "fusion", "decomposition", "clone", "remap"}
 _DIAGNOSTIC_CODES = {"collection-failure", "upstream-projection-failure"}
@@ -567,11 +571,14 @@ def _merge_projections(destination_value: object, incoming_value: object) -> Non
             destination[compile_id] = copy.deepcopy(projection)
             continue
         existing = _require_mapping(existing_value, "existing upstream projection")
-        for field in ("source", "version", "producer", "settings", "kernels"):
+        for field in ("source", "version", "producer", "kernels"):
             if existing[field] != projection[field]:
                 raise ProvenanceArtifactError(
                     f"conflicting upstream projection metadata for key {compile_id}"
                 )
+        settings = _merge_projection_settings(
+            existing["settings"], projection["settings"]
+        )
         uncollected_kernels = sorted(
             set(existing["uncollectedKernels"]) | set(projection["uncollectedKernels"])
         )
@@ -583,16 +590,21 @@ def _merge_projections(destination_value: object, incoming_value: object) -> Non
         incoming_rank = _JOIN_RANK[projection["upstreamJoin"]]
         if existing_rank > incoming_rank:
             _require_projection_subset(projection, existing, compile_id)
+            existing["settings"] = settings
             existing["uncollectedKernels"] = uncollected_kernels
             existing["upstreamProjectionFailed"] = upstream_projection_failed
             continue
         if incoming_rank > existing_rank:
             _require_projection_subset(existing, projection, compile_id)
             replacement = copy.deepcopy(projection)
+            replacement["settings"] = settings
             replacement["uncollectedKernels"] = uncollected_kernels
             replacement["upstreamProjectionFailed"] = upstream_projection_failed
             destination[compile_id] = replacement
             continue
+        # Defensive drift guard: unreachable while _JOIN_RANK values are unique,
+        # but intentionally loud if a future status shares an existing rank
+        # without defining an equivalence contract.
         if existing["upstreamJoin"] != projection["upstreamJoin"]:
             raise ProvenanceArtifactError(
                 f"conflicting upstream join status for key {compile_id}"
@@ -602,8 +614,38 @@ def _merge_projections(destination_value: object, incoming_value: object) -> Non
         # captures are complete, so merge them instead of treating inequality as
         # a content conflict.
         _merge_projection_content(existing, projection)
+        existing["settings"] = settings
         existing["uncollectedKernels"] = uncollected_kernels
         existing["upstreamProjectionFailed"] = upstream_projection_failed
+
+
+def _merge_projection_settings(
+    first_value: object, second_value: object
+) -> dict[str, object]:
+    """Retain the strongest settings observed for one merged compile ID."""
+    first = _require_mapping(first_value, "projection settings")
+    second = _require_mapping(second_value, "incoming projection settings")
+    expected_keys = {"provenanceTrackingLevel", "structuredTracing"}
+    _require_exact_keys(first, expected_keys, "projection settings")
+    _require_exact_keys(second, expected_keys, "incoming projection settings")
+    first_level = _require_int(
+        first["provenanceTrackingLevel"],
+        "provenance tracking level",
+        minimum=0,
+    )
+    second_level = _require_int(
+        second["provenanceTrackingLevel"],
+        "incoming provenance tracking level",
+        minimum=0,
+    )
+    first_tracing = first["structuredTracing"]
+    second_tracing = second["structuredTracing"]
+    if not isinstance(first_tracing, bool) or not isinstance(second_tracing, bool):
+        raise ProvenanceArtifactError("structured tracing setting must be boolean")
+    return {
+        "provenanceTrackingLevel": max(first_level, second_level),
+        "structuredTracing": first_tracing or second_tracing,
+    }
 
 
 def _merge_projection_content(

@@ -143,18 +143,18 @@
       }
     },
     "settings": {
-      "description": "Upstream provenance and structured-tracing settings for one compile contribution.",
+      "description": "Strongest upstream provenance and structured-tracing settings observed across contributions merged into one compile identity.",
       "type": "object",
       "additionalProperties": false,
       "required": ["provenanceTrackingLevel", "structuredTracing"],
       "properties": {
         "provenanceTrackingLevel": {
-          "description": "Observed torch._inductor.config.trace.provenance_tracking_level. Phase 3b never changes it.",
+          "description": "Maximum observed torch._inductor.config.trace.provenance_tracking_level across merged contributions.",
           "type": "integer",
           "minimum": 0
         },
         "structuredTracing": {
-          "description": "Whether upstream structured tracing was active for this contribution.",
+          "description": "Whether upstream structured tracing was active for any merged contribution.",
           "type": "boolean"
         }
       }
