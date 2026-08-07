@@ -1953,6 +1953,105 @@ class TestProvenanceArtifactPublication:
 
         assert path.read_bytes() == fresh_bytes
 
+    def test_projection_settings_enrich_monotonically_across_levels(self, tmp_path):
+        from torch_spyre._inductor import provenance_writer
+
+        path = tmp_path / "settings-levels.json"
+        collection = _publication_collection(registration_ordinal=1)
+        inactive_handler = LazyTraceHandler(root_dir=None)
+        active_handler = LazyTraceHandler(root_dir=str(tmp_path))
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 0),
+            patch.object(provenance_writer.trace_log, "handlers", [inactive_handler]),
+        ):
+            assert publish_provenance_collection(collection, str(path)) == "written"
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch.object(provenance_writer.trace_log, "handlers", [active_handler]),
+        ):
+            assert publish_provenance_collection(collection, str(path)) == "written"
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        projection = document["upstreamProjections"][collection.compile_id]
+        assert projection["settings"] == {
+            "provenanceTrackingLevel": 1,
+            "structuredTracing": True,
+        }
+        assert document["mergeGeneration"] == 2
+        richer_bytes = path.read_bytes()
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 0),
+            patch.object(provenance_writer.trace_log, "handlers", [inactive_handler]),
+        ):
+            assert publish_provenance_collection(collection, str(path)) == "unchanged"
+        assert path.read_bytes() == richer_bytes
+
+    def test_equal_rank_projection_retains_structured_tracing_evidence(self, tmp_path):
+        from torch_spyre._inductor import provenance_writer
+
+        path = tmp_path / "settings-tracing.json"
+        collection = _publication_collection(registration_ordinal=1)
+        inactive_handler = LazyTraceHandler(root_dir=None)
+        active_handler = LazyTraceHandler(root_dir=str(tmp_path))
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch.object(provenance_writer.trace_log, "handlers", [inactive_handler]),
+        ):
+            assert publish_provenance_collection(collection, str(path)) == "written"
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch.object(provenance_writer.trace_log, "handlers", [active_handler]),
+        ):
+            assert publish_provenance_collection(collection, str(path)) == "written"
+
+        document = json.loads(path.read_text(encoding="utf-8"))
+        projection = document["upstreamProjections"][collection.compile_id]
+        assert projection["settings"] == {
+            "provenanceTrackingLevel": 1,
+            "structuredTracing": True,
+        }
+        assert document["mergeGeneration"] == 2
+
+    def test_unavailable_join_reasons_prefer_enabled_cache_replay(self, tmp_path):
+        fresh_level_zero = _publication_collection()
+        cache_level_one = _publication_collection(has_graph_lowering=False)
+        level_zero_first = tmp_path / "level-zero-first.json"
+        cache_first = tmp_path / "cache-first.json"
+
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 0):
+            assert (
+                publish_provenance_collection(fresh_level_zero, str(level_zero_first))
+                == "written"
+            )
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 1):
+            assert (
+                publish_provenance_collection(cache_level_one, str(level_zero_first))
+                == "written"
+            )
+            assert (
+                publish_provenance_collection(cache_level_one, str(cache_first))
+                == "written"
+            )
+        with torch._inductor.config.patch("trace.provenance_tracking_level", 0):
+            assert (
+                publish_provenance_collection(fresh_level_zero, str(cache_first))
+                == "unchanged"
+            )
+
+        first_document = json.loads(level_zero_first.read_text(encoding="utf-8"))
+        second_document = json.loads(cache_first.read_text(encoding="utf-8"))
+        for document in (first_document, second_document):
+            projection = document["upstreamProjections"][cache_level_one.compile_id]
+            assert projection["upstreamJoin"] == "unavailable-cache-replay"
+            assert projection["settings"]["provenanceTrackingLevel"] == 1
+        first_document.pop("mergeGeneration")
+        second_document.pop("mergeGeneration")
+        assert first_document == second_document
+
     def test_multiple_wrappers_coexist_and_diagnostics_are_idempotent(self, tmp_path):
         path = tmp_path / "multi-wrapper.json"
         first = _publication_collection(
