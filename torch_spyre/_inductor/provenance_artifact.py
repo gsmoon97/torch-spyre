@@ -16,7 +16,8 @@
 
 This module stops at an immutable in-memory contribution. Physical publication,
 upstream projection, and merge policy are separate lifecycle steps so finalized
-OpSpec collection remains reusable by a future KTIR serializer.
+OpSpec collection remains reusable by a future KTIR serializer while wire
+serialization stays independently testable.
 """
 
 from __future__ import annotations

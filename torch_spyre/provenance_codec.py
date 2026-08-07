@@ -28,8 +28,8 @@ _SUPPORTED_KEY_WIDTHS = {
     KERNEL_PROVENANCE_KEY_VERSION: KERNEL_PROVENANCE_KEY_BASE32_WIDTH
 }
 # The separator before the key is unambiguous because ``_`` is not in the
-# lowercase base32 alphabet. Revisit this parser if a future version changes
-# the alphabet.
+# lowercase base32 alphabet. Every supported version must keep the separator
+# outside its declared key alphabet.
 _EVENT_KEY_RE = regex.compile(
     r"\Aspyre_kernel_v(?P<version>[0-9]+)_"
     r"[A-Za-z0-9_]+?_"
