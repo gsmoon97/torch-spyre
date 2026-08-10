@@ -1867,6 +1867,98 @@ class TestProvenanceArtifactPublication:
             path.read_text(encoding="utf-8")
         )
 
+    def test_projection_canonicalizes_numeric_suffix_inverse_order(self, tmp_path):
+        collection = _publication_collection(registration_ordinal=1)
+        alias = "sdsc_fused_mm_0:1"
+        node_mapping = {
+            "version": 2.0,
+            "preToPost": {
+                "attn_9": ["permute_53"],
+                "attn_10": ["permute_53"],
+                "attn_99": ["permute_503"],
+                "attn_100": ["permute_503"],
+            },
+            "postToPre": {
+                "permute_53": ["attn_9", "attn_10"],
+                "permute_503": ["attn_99", "attn_100"],
+            },
+            "cppCodeToPost": {alias: ["permute_53", "permute_503"]},
+            "postToCppCode": {
+                "permute_53": [alias],
+                "permute_503": [alias],
+            },
+        }
+        kernel_information = {
+            alias: {
+                "stack_traces": ["model.py:10"],
+                "post_grad_nodes": ["permute_53", "permute_503"],
+                "pre_grad_nodes": [
+                    "attn_9",
+                    "attn_10",
+                    "attn_99",
+                    "attn_100",
+                ],
+            }
+        }
+
+        with (
+            torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+            patch(
+                "torch_spyre._inductor.provenance_writer.inductor_debug."
+                "dump_inductor_provenance_info",
+                return_value=node_mapping,
+            ),
+            patch(
+                "torch_spyre._inductor.provenance_writer.inductor_debug."
+                "create_kernel_information_json",
+                return_value=kernel_information,
+            ),
+        ):
+            projection = capture_upstream_projection(collection)
+
+        assert projection is not None
+        assert not projection.failed
+        assert projection.upstream_join == "ok"
+        assert projection.post_to_pre == {
+            "permute_503": ("attn_100", "attn_99"),
+            "permute_53": ("attn_10", "attn_9"),
+        }
+
+        path = tmp_path / "numeric-suffix-order.json"
+        assert (
+            publish_provenance_collection(
+                collection,
+                str(path),
+                upstream_projection=projection,
+            )
+            == "written"
+        )
+        document = json.loads(path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        _SCHEMA_VALIDATOR.validate(document)
+
+        persisted = document["upstreamProjections"][collection.compile_id]
+        assert persisted["postToPre"] == {
+            "permute_503": ["attn_100", "attn_99"],
+            "permute_53": ["attn_10", "attn_9"],
+        }
+        expected_pairs = {
+            ("attn_9", "permute_53"),
+            ("attn_10", "permute_53"),
+            ("attn_99", "permute_503"),
+            ("attn_100", "permute_503"),
+        }
+        assert {
+            (pre_node, post_node)
+            for pre_node, post_nodes in persisted["preToPost"].items()
+            for post_node in post_nodes
+        } == expected_pairs
+        assert {
+            (pre_node, post_node)
+            for post_node, pre_nodes in persisted["postToPre"].items()
+            for pre_node in pre_nodes
+        } == expected_pairs
+
     def test_incomplete_upstream_projection_is_partial_and_diagnostic(self, tmp_path):
         collection = _publication_collection(registration_ordinal=1)
         with (

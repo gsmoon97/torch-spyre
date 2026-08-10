@@ -186,12 +186,13 @@ def capture_upstream_projection(
     reachable_post_nodes = {
         post_node for values in cpp_to_post.values() for post_node in values
     }
-    post_to_pre = {
+    filtered_post_to_pre = {
         post_node: upstream_post_to_pre[post_node]
         for post_node in sorted(reachable_post_nodes)
         if post_node in upstream_post_to_pre
     }
-    pre_to_post = _tuple_name_map(_invert_name_map(post_to_pre))
+    pre_to_post = _tuple_name_map(_invert_name_map(filtered_post_to_pre))
+    post_to_pre = _tuple_name_map(_invert_name_map(pre_to_post))
     post_to_cpp = _tuple_name_map(_invert_name_map(cpp_to_post))
 
     upstream_stacks = _require_mapping(
@@ -218,7 +219,7 @@ def capture_upstream_projection(
             dict.fromkeys(
                 pre_node
                 for post_node in expected_post_nodes
-                for pre_node in post_to_pre.get(post_node, ())
+                for pre_node in filtered_post_to_pre.get(post_node, ())
             )
         )
         stack_contexts_match &= (
