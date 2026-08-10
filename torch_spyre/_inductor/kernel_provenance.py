@@ -84,8 +84,9 @@ class KernelProvenanceDescriptor:
     directly attached DebugHandle ID. ``debug_handle_ids`` is the ordered,
     deduplicated set exposed to profiler consumers; recursive ``fused_from``
     lineage remains in the handle records. Because handle IDs derive from
-    source metadata and IR names, key stability is scoped to equivalent
-    recompiles in the same source/toolchain context, not source relocation.
+    source metadata, IR names, and fused constituent IDs, key stability is
+    scoped to equivalent recompiles in the same source/toolchain context, not
+    source relocation.
     ``aten_ops`` contains sorted,
     deduplicated ATen names for human-readable consumers; it is not identity.
     """
@@ -139,7 +140,7 @@ def _iter_debug_handles(
 
 
 def _deduplicate_handles(handles: Iterator[DebugHandle]) -> tuple[DebugHandle, ...]:
-    # IDs hash source, ATen op, and IR chain, so equal IDs assume matching lineage.
+    # IDs hash structured source, ATen op, ordered IR chain, and ordered fused IDs.
     unique: list[DebugHandle] = []
     seen_ids: set[int] = set()
     for handle in handles:

@@ -111,6 +111,10 @@ The name describes bundle-level attribution:
   to finalized `OpSpec` records. Recursive `fused_from` records provide the
   constituent source and ATen lineage; the readable summary may use those
   constituents without adding their IDs to the direct list.
+- Each `debug_handle` ID is a versioned 63-bit content hash of its complete
+  structured source range, ATen op, ordered IR chain, and ordered fused
+  constituent IDs. Transformation history is excluded because it describes how
+  the operation was produced rather than which operation it represents.
 - A valid bundle with no handles still receives a key and uses
   `fused_unknown` as its display summary.
 
