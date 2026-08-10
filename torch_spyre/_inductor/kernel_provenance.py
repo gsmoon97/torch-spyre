@@ -139,6 +139,7 @@ def _iter_debug_handles(
 
 
 def _deduplicate_handles(handles: Iterator[DebugHandle]) -> tuple[DebugHandle, ...]:
+    # IDs hash source, ATen op, and IR chain, so equal IDs assume matching lineage.
     unique: list[DebugHandle] = []
     seen_ids: set[int] = set()
     for handle in handles:
