@@ -401,3 +401,4 @@ stubs
 # provenance outputs
 provenance_capture_raw.json
 spyre_provenance.json
+.spyre_provenance.json.*.tmp

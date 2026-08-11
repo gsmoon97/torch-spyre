@@ -16,15 +16,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Literal
 
 import regex as re
@@ -268,24 +270,25 @@ def publish_provenance_collection(
     )
     result: PublicationResult = "written"
     with _PUBLICATION_LOCK:
-        existing = _read_existing_document(path)
-        if existing is None:
-            if not contribution["kernelIdentities"]:
-                raise ProvenanceArtifactError(
-                    f"cannot create {path.name} without a collected kernel identity"
-                )
-            document = _new_document(contribution)
-        else:
-            validate_provenance_document(existing)
-            document = _merge_document(existing, contribution)
-            if _without_generation(document) == _without_generation(existing):
-                result = "unchanged"
+        with _interprocess_publication_lock(path):
+            existing = _read_existing_document(path)
+            if existing is None:
+                if not contribution["kernelIdentities"]:
+                    raise ProvenanceArtifactError(
+                        f"cannot create {path.name} without a collected kernel identity"
+                    )
+                document = _new_document(contribution)
+            else:
+                validate_provenance_document(existing)
+                document = _merge_document(existing, contribution)
+                if _without_generation(document) == _without_generation(existing):
+                    result = "unchanged"
 
-        document = _canonicalize_document(document)
-        validate_provenance_document(document)
-        payload = _serialize_document(document)
-        if result == "written":
-            _atomic_write(path, payload)
+            document = _canonicalize_document(document)
+            validate_provenance_document(document)
+            payload = _serialize_document(document)
+            if result == "written":
+                _atomic_write(path, payload)
 
     # Always submit enabled publications to PyTorch logging. Its handlers own
     # durable trace emission; structuredTracing only records destination state.
@@ -1222,6 +1225,29 @@ def _read_existing_document(path: Path) -> dict[str, Any] | None:
     return value
 
 
+@contextlib.contextmanager
+def _interprocess_publication_lock(path: Path) -> Iterator[None]:
+    """Serialize cooperating publishers without creating a stale lock file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(directory_fd)
+            raise
+    except OSError:
+        raise ProvenanceArtifactError(f"failed to lock {path.name}") from None
+
+    try:
+        yield
+    finally:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+
+
 def _atomic_write(path: Path, payload: str) -> None:
     temporary_path: Path | None = None
     try:
@@ -1236,6 +1262,8 @@ def _atomic_write(path: Path, payload: str) -> None:
         ) as temporary:
             temporary_path = Path(temporary.name)
             temporary.write(payload)
+            temporary.flush()
+            os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
     except OSError:

@@ -80,14 +80,16 @@ def resolve_provenance_event(
     """Resolve one saved event name against one saved provenance sidecar."""
     path = Path(artifact_path)
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError):
+        payload = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError):
         return _failure_result(
             event_name,
             "artifact-read-failure",
             f"failed to read {path.name}",
         )
-    except json.JSONDecodeError:
+    try:
+        document = json.loads(payload)
+    except (RecursionError, ValueError):
         return _failure_result(
             event_name,
             "schema-validation-failure",
@@ -396,7 +398,7 @@ def _validate_document(document: object) -> dict[str, Any]:
         )
     try:
         _validate_schema(document, _schema(), _schema(), "$")
-    except ValueError as error:
+    except (RecursionError, ValueError) as error:
         raise _ReaderError("schema-validation-failure", str(error)) from None
     try:
         _validate_semantics(document)
