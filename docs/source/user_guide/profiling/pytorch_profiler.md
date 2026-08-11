@@ -141,6 +141,13 @@ Disabling backend autoload is required for this module command because Python
 initializes the `torch_spyre` package before executing the reader. The reader
 uses only the saved event and sidecar and does not import compiler internals.
 
+When several processes publish to the same configured sidecar path, cooperating
+writers hold an advisory file lock across the complete read-merge-write
+transaction. Publication flushes and synchronizes the same-directory temporary
+file before atomically replacing the sidecar. The parent directory itself is
+not synchronized, so persistence of the rename across abrupt power loss remains
+filesystem-dependent.
+
 The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
 key or a cross-machine artifact identifier; source-path, schema, or toolchain
 changes can produce a different key. A content hash is used instead of a

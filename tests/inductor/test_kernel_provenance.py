@@ -21,10 +21,12 @@ import dataclasses
 import hashlib
 from importlib.resources import files
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import types
 from unittest.mock import patch
 
@@ -89,6 +91,7 @@ from torch_spyre.execution.async_compile import SpyreAsyncCompile
 from torch_spyre.execution.kernel_runner import SpyreSDSCKernelRunner
 from torch_spyre.provenance import (
     resolve_provenance_document,
+    resolve_provenance_event,
 )
 
 
@@ -196,6 +199,41 @@ def _publication_collection(
     collection = builder.finish(registration_state)
     assert collection is not None
     return collection
+
+
+def _publish_collection_in_process(
+    path: str,
+    kernel_name: str,
+    handle_id: int,
+    registration_ordinal: int,
+    start_event,
+) -> None:
+    """Publish after a delayed read to expose cross-process lost updates."""
+    from torch_spyre._inductor import provenance_writer
+
+    collection = _publication_collection(
+        kernel_name=kernel_name,
+        handle_id=handle_id,
+        registration_ordinal=registration_ordinal,
+    )
+    read_existing_document = provenance_writer._read_existing_document
+
+    def delayed_read(candidate_path):
+        document = read_existing_document(candidate_path)
+        time.sleep(0.25)
+        return document
+
+    start_event.wait()
+    with (
+        torch._inductor.config.patch("trace.provenance_tracking_level", 1),
+        patch.object(
+            provenance_writer,
+            "_read_existing_document",
+            side_effect=delayed_read,
+        ),
+        patch.object(provenance_writer, "trace_structured_artifact"),
+    ):
+        publish_provenance_collection(collection, path)
 
 
 def _generated_wrapper_roundtrip(specs):
@@ -1656,6 +1694,27 @@ class TestProvenanceArtifactResolver:
                 == (fixture["expectedReaderDiagnostic"])
             ), fixture["name"]
 
+    def test_deeply_nested_json_reports_schema_failure(self, tmp_path):
+        path = tmp_path / "deep.json"
+        path.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+
+        result = resolve_provenance_event(self._EVENT_BASE, path)
+
+        assert result["status"] == "error"
+        assert result["diagnostics"][0]["code"] == "schema-validation-failure"
+
+    def test_recursive_runtime_schema_validation_reports_schema_failure(self):
+        document = _load_provenance_fixture("valid_v1.json")
+
+        with patch(
+            "torch_spyre.provenance._validate_schema",
+            side_effect=RecursionError,
+        ):
+            result = resolve_provenance_document(self._EVENT_BASE, document)
+
+        assert result["status"] == "error"
+        assert result["diagnostics"][0]["code"] == "schema-validation-failure"
+
     def test_missing_key_and_collision_are_distinct(self):
         document = _load_provenance_fixture("valid_v1.json")
         missing = resolve_provenance_document(
@@ -2252,6 +2311,37 @@ class TestProvenanceArtifactPublication:
             collection.compile_id for collection in collections
         }
         assert len(document["kernelOccurrences"]) == len(collections)
+
+    def test_cross_process_publications_merge_without_lost_updates(self, tmp_path):
+        path = tmp_path / "multiprocess.json"
+        context = multiprocessing.get_context("spawn")
+        start_event = context.Event()
+        processes = [
+            context.Process(
+                target=_publish_collection_in_process,
+                args=(
+                    str(path),
+                    f"sdsc_fused_mm_{index}",
+                    200 + index,
+                    index + 1,
+                    start_event,
+                ),
+            )
+            for index in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+        start_event.set()
+        for process in processes:
+            process.join(timeout=10)
+
+        assert [process.exitcode for process in processes] == [0, 0]
+        document = json.loads(path.read_text(encoding="utf-8"))
+        validate_provenance_document(document)
+        assert document["mergeGeneration"] == len(processes)
+        assert len(document["kernelIdentities"]) == len(processes)
+        assert len(document["kernelOccurrences"]) == len(processes)
 
     def test_complete_projection_survives_later_partial_contribution(self, tmp_path):
         path = tmp_path / "rich-then-partial.json"

@@ -402,6 +402,7 @@ stubs
 provenance_capture_raw.json
 
 spyre_provenance.json
+.spyre_provenance.json.*.tmp
 # Cost-model measurement database: fetched, not committed (tools/cost_model/records.py)
 tools/cost_model/sweep_records.json
 tools/cost_model/sweep_records.json.part
