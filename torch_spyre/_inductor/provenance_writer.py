@@ -19,7 +19,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
-import fcntl
 import hashlib
 import json
 import os
@@ -44,6 +43,13 @@ from torch_spyre._inductor.profiler_event import (
 )
 from torch_spyre._inductor.provenance_artifact import CollectedProvenance
 from torch_spyre.version import __version__ as torch_spyre_version
+
+
+_fcntl: Any
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
 
 
 PublicationResult = Literal["disabled", "unchanged", "written"]
@@ -1231,11 +1237,16 @@ def _interprocess_publication_lock(path: Path) -> Iterator[None]:
 
     This advisory lock does not protect against non-cooperating writers.
     """
+    if _fcntl is None:
+        raise ProvenanceArtifactError(
+            f"interprocess locking unavailable for {path.name}"
+        )
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
-            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            _fcntl.flock(directory_fd, _fcntl.LOCK_EX)
         except OSError:
             os.close(directory_fd)
             raise

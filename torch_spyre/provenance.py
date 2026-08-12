@@ -397,8 +397,9 @@ def _validate_document(document: object) -> dict[str, Any]:
             "artifact schema version is not supported",
         )
     try:
-        _validate_schema(document, _schema(), _schema(), "$")
-    except (RecursionError, ValueError) as error:
+        schema = _schema()
+        _validate_schema(document, schema, schema, "$")
+    except (OSError, UnicodeError, RecursionError, ValueError) as error:
         raise _ReaderError("schema-validation-failure", str(error)) from None
     try:
         _validate_semantics(document)
@@ -415,7 +416,10 @@ def _schema() -> dict[str, Any]:
         / "schemas"
         / "spyre_provenance_v1.schema.json"
     )
-    return json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("packaged provenance schema must be an object")
+    return value
 
 
 # Keep this dependency-free JSON Schema subset in parity with the packaged v1
@@ -435,8 +439,12 @@ def _validate_schema(
         for token in reference[2:].split("/"):
             if not isinstance(target, Mapping):
                 raise ValueError(f"{path}: invalid schema reference")
-            target = target[token.replace("~1", "/").replace("~0", "~")]
-        assert isinstance(target, Mapping)
+            decoded_token = token.replace("~1", "/").replace("~0", "~")
+            if decoded_token not in target:
+                raise ValueError(f"{path}: invalid schema reference")
+            target = target[decoded_token]
+        if not isinstance(target, Mapping):
+            raise ValueError(f"{path}: invalid schema reference")
         _validate_schema(value, target, root, path)
         return
     if "oneOf" in schema:

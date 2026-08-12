@@ -15,6 +15,7 @@
 """Device-free tests for kernel provenance identity and event transport."""
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import copy
 import ctypes
 import dataclasses
@@ -1772,6 +1773,33 @@ class TestProvenanceArtifactResolver:
         assert result["status"] == "error"
         assert result["diagnostics"][0]["code"] == "schema-validation-failure"
 
+    def test_malformed_packaged_schema_reference_reports_schema_failure(self):
+        document = _load_provenance_fixture("valid_v1.json")
+        malformed_schema = {"$ref": "#/target", "target": []}
+
+        with patch("torch_spyre.provenance._schema", return_value=malformed_schema):
+            result = resolve_provenance_document(self._EVENT_BASE, document)
+
+        assert result["status"] == "error"
+        assert result["diagnostics"][0]["code"] == "schema-validation-failure"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("missing"),
+            UnicodeError("invalid encoding"),
+            ValueError("invalid JSON"),
+        ],
+    )
+    def test_packaged_schema_load_failure_is_structured(self, error):
+        document = _load_provenance_fixture("valid_v1.json")
+
+        with patch("torch_spyre.provenance._schema", side_effect=error):
+            result = resolve_provenance_document(self._EVENT_BASE, document)
+
+        assert result["status"] == "error"
+        assert result["diagnostics"][0]["code"] == "schema-validation-failure"
+
     def test_missing_key_and_collision_are_distinct(self):
         document = _load_provenance_fixture("valid_v1.json")
         missing = resolve_provenance_document(
@@ -2609,17 +2637,26 @@ class TestProvenanceArtifactPublication:
         structured_artifact.assert_not_called()
         assert not path.exists()
 
-    def test_wait_corrupt_sidecar_preserves_runtime_descriptor(self, tmp_path):
+    @pytest.mark.parametrize("failure_mode", ["corrupt-sidecar", "missing-lock"])
+    def test_wait_publication_failure_preserves_runtime_descriptor(
+        self, tmp_path, failure_mode
+    ):
         specs = [_op(_handle(9))]
         runner = object()
         compiler = SpyreAsyncCompile()
         graph = _graph_lowering()
         configured_path = tmp_path / "private" / "sidecar.json"
-        configured_path.parent.mkdir()
-        configured_path.write_text("{not-json", encoding="utf-8")
-        corrupt_bytes = configured_path.read_bytes()
+        if failure_mode == "corrupt-sidecar":
+            configured_path.parent.mkdir()
+            configured_path.write_text("{not-json", encoding="utf-8")
+            original_bytes = configured_path.read_bytes()
+            lock_context = contextlib.nullcontext()
+        else:
+            original_bytes = None
+            lock_context = patch("torch_spyre._inductor.provenance_writer._fcntl", None)
 
         with (
+            lock_context,
             V.set_graph_handler(graph),
             spyre_config.patch({"provenance_artifact_path": str(configured_path)}),
             patch(
@@ -2642,7 +2679,10 @@ class TestProvenanceArtifactPublication:
         assert result is runner
         assert descriptor is not None
         assert compiler._last_provenance_collection is not None
-        assert configured_path.read_bytes() == corrupt_bytes
+        if original_bytes is None:
+            assert not configured_path.exists()
+        else:
+            assert configured_path.read_bytes() == original_bytes
         assert warning.call_count == 2
         assert warning.call_args_list[0].args == (
             "provenance sidecar publication failed for %s; continuing compilation",
