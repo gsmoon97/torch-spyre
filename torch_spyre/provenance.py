@@ -418,6 +418,9 @@ def _schema() -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Keep this dependency-free JSON Schema subset in parity with the packaged v1
+# schema. The fixture suite also runs the real jsonschema validator as an
+# independent oracle; schema changes must update both implementations and tests.
 def _validate_schema(
     value: object,
     schema: Mapping[str, object],

@@ -1227,7 +1227,10 @@ def _read_existing_document(path: Path) -> dict[str, Any] | None:
 
 @contextlib.contextmanager
 def _interprocess_publication_lock(path: Path) -> Iterator[None]:
-    """Serialize cooperating publishers without creating a stale lock file."""
+    """Serialize cooperating publishers without creating a stale lock file.
+
+    This advisory lock does not protect against non-cooperating writers.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         directory_fd = os.open(path.parent, os.O_RDONLY)
