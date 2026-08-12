@@ -1209,6 +1209,75 @@ class TestKernelProvenancePropagation:
             profiler_name=_event_name(descriptor),
         )
 
+    def test_runner_keeps_event_name_when_native_registration_fails(self):
+        descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
+        assert descriptor is not None
+
+        with (
+            patch(
+                "torch_spyre.execution.kernel_runner.register_kernel_provenance",
+                side_effect=RuntimeError("registry failed"),
+            ) as register_kernel_provenance,
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.logger.warning") as warning,
+        ):
+            runner = SpyreSDSCKernelRunner(
+                "sdsc_fused_mm_0",
+                "/tmp/kernel",
+                kernel_provenance=descriptor,
+            )
+
+        assert runner.kernel_provenance is descriptor
+        assert runner.profiler_event_name == _event_name(descriptor)
+        assert runner.jobplan == "jobplan"
+        register_kernel_provenance.assert_called_once_with(
+            _event_name(descriptor), list(descriptor.debug_handle_ids)
+        )
+        prepare_kernel.assert_called_once_with(
+            "/tmp/kernel/spyreCodeDir",
+            profiler_name=_event_name(descriptor),
+        )
+        warning.assert_called_once()
+        assert warning.call_args.args[1] == "sdsc_fused_mm_0"
+        assert warning.call_args.kwargs["exc_info"] is True
+
+    def test_runner_uses_legacy_prepare_when_event_formatting_fails(self):
+        descriptor = build_kernel_provenance_descriptor([_op(_handle(9))])
+        assert descriptor is not None
+
+        with (
+            patch(
+                "torch_spyre.execution.kernel_runner."
+                "format_kernel_provenance_event_name",
+                side_effect=RuntimeError("formatting failed"),
+            ),
+            patch(
+                "torch_spyre.execution.kernel_runner.register_kernel_provenance"
+            ) as register_kernel_provenance,
+            patch(
+                "torch_spyre.execution.kernel_runner.prepare_kernel",
+                return_value="jobplan",
+            ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.logger.warning") as warning,
+        ):
+            runner = SpyreSDSCKernelRunner(
+                "sdsc_fused_mm_0",
+                "/tmp/kernel",
+                kernel_provenance=descriptor,
+            )
+
+        assert runner.kernel_provenance is descriptor
+        assert runner.profiler_event_name is None
+        assert runner.jobplan == "jobplan"
+        register_kernel_provenance.assert_not_called()
+        prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")
+        warning.assert_called_once()
+        assert warning.call_args.args[1] == "sdsc_fused_mm_0"
+        assert warning.call_args.kwargs["exc_info"] is True
+
     def test_runner_preserves_legacy_prepare_call_without_descriptor(self):
         with (
             patch(
