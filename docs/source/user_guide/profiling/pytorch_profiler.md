@@ -129,8 +129,11 @@ metadata:
 The key-bearing event name remains the compatibility join for raw traces and
 name-only consumers. The trace does not embed source locations or full
 transformation lineage. Durable source attribution requires pairing it with
-`spyre_provenance.json`, which Phase 3b writes. Resolve a saved event and
-sidecar with the offline reader:
+`spyre_provenance.json`, which Phase 3b writes. By default, the sidecar is
+written under the run-scoped Inductor debug directory. Set
+`TORCH_SPYRE_PROVENANCE_PATH` to redirect it, or set the variable to an empty
+string to disable publication. Resolve a saved event and sidecar with the
+offline reader:
 
 ```shell
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch_spyre.provenance \
@@ -143,10 +146,11 @@ uses only the saved event and sidecar and does not import compiler internals.
 
 When several processes publish to the same configured sidecar path, cooperating
 writers hold an advisory file lock across the complete read-merge-write
-transaction. Publication flushes and synchronizes the same-directory temporary
-file before atomically replacing the sidecar. The parent directory itself is
-not synchronized, so persistence of the rename across abrupt power loss remains
-filesystem-dependent.
+transaction. Non-cooperating writers are not protected by this lock and can
+still race with publication. Publication flushes and synchronizes the
+same-directory temporary file before atomically replacing the sidecar. The
+parent directory itself is not synchronized, so persistence of the rename
+across abrupt power loss remains filesystem-dependent.
 
 The v1 key is a trace-to-sidecar join key only. It is not a compilation cache
 key or a cross-machine artifact identifier; source-path, schema, or toolchain

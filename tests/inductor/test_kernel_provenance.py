@@ -2609,12 +2609,15 @@ class TestProvenanceArtifactPublication:
         structured_artifact.assert_not_called()
         assert not path.exists()
 
-    def test_wait_publication_failure_preserves_runtime_descriptor(self, tmp_path):
+    def test_wait_corrupt_sidecar_preserves_runtime_descriptor(self, tmp_path):
         specs = [_op(_handle(9))]
         runner = object()
         compiler = SpyreAsyncCompile()
         graph = _graph_lowering()
         configured_path = tmp_path / "private" / "sidecar.json"
+        configured_path.parent.mkdir()
+        configured_path.write_text("{not-json", encoding="utf-8")
+        corrupt_bytes = configured_path.read_bytes()
 
         with (
             V.set_graph_handler(graph),
@@ -2630,10 +2633,6 @@ class TestProvenanceArtifactPublication:
                 return_value=runner,
             ) as runner_type,
             patch("torch_spyre.execution.async_compile.AsyncCompile.wait"),
-            patch(
-                "torch_spyre.execution.async_compile.publish_provenance_collection",
-                side_effect=ProvenanceArtifactError("failed to write sidecar.json"),
-            ),
             patch("torch_spyre.execution.async_compile.logger.warning") as warning,
         ):
             result = compiler.sdsc("sdsc_fused_mm_0", specs)
@@ -2643,6 +2642,7 @@ class TestProvenanceArtifactPublication:
         assert result is runner
         assert descriptor is not None
         assert compiler._last_provenance_collection is not None
+        assert configured_path.read_bytes() == corrupt_bytes
         assert warning.call_count == 2
         assert warning.call_args_list[0].args == (
             "provenance sidecar publication failed for %s; continuing compilation",
