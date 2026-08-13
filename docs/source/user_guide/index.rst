@@ -11,6 +11,7 @@ debugging, and worked examples.
    running_models
    supported_operations
    tensors_and_layouts
+   provenance/index
    profiling/index
    debugging/index
    examples/index

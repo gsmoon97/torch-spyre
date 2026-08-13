@@ -59,7 +59,7 @@ _OCCURRENCE_SUMMARY_FIELDS = (
 )
 
 
-class _ReaderError(Exception):
+class ProvenanceReaderError(ValueError):
     """Expected reader rejection with a stable machine-readable code."""
 
     def __init__(self, code: str, message: str):
@@ -67,8 +67,36 @@ class _ReaderError(Exception):
         self.code = code
 
 
+_ReaderError = ProvenanceReaderError
+
+
 class _SemanticError(ValueError):
     """Artifact content violates a cross-record or derivation invariant."""
+
+
+def load_provenance_document(artifact_path: str | Path) -> dict[str, Any]:
+    """Read and validate one sidecar for repeated offline queries.
+
+    The returned object has passed both the packaged v1 schema and semantic
+    validation. Consumers that resolve many events can load once instead of
+    invoking the validating document resolver for every event.
+    """
+    path = Path(artifact_path)
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ProvenanceReaderError(
+            "artifact-read-failure",
+            f"failed to read {path.name}",
+        ) from error
+    try:
+        document = json.loads(payload)
+    except (RecursionError, ValueError) as error:
+        raise ProvenanceReaderError(
+            "schema-validation-failure",
+            f"invalid JSON in {path.name}",
+        ) from error
+    return _validate_document(document)
 
 
 def resolve_provenance_event(
