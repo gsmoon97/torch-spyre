@@ -54,7 +54,9 @@ const dom = new JSDOM(html, {
 });
 const { document, Event } = dom.window;
 
-assert.equal(document.querySelectorAll("select").length, 2);
+const viewer = dom.window.__spyreProvenanceViewer;
+const hasComparison = Boolean(viewer.data.comparisonAnalysis);
+assert.equal(document.querySelectorAll("select").length, hasComparison ? 3 : 2);
 assert.equal(document.querySelectorAll(".panel").length, 6);
 assert.equal(document.querySelectorAll(".panel-description").length, 6);
 assert.equal(document.querySelectorAll(".row-explanation").length, 0);
@@ -129,3 +131,29 @@ assert.equal(
 );
 
 process.stdout.write("Spyre provenance viewer DOM check passed\n");
+if (hasComparison) {
+  assert.equal(document.querySelectorAll(".mode-button").length, 2);
+  assert.equal(viewer.state.mode, "compare");
+  assert.equal(document.getElementById("compare-view").hidden, false);
+  assert.equal(document.getElementById("explore-view").hidden, true);
+  assert.equal(
+    document.querySelectorAll(".run-card").length,
+    viewer.data.comparisonAnalysis.groups.length
+  );
+  assert.ok(document.querySelector(".cohort-summary").textContent.includes("Bundle pattern"));
+  const cohortFilter = document.querySelector('input[type="search"]');
+  const cohortSelect = document.querySelector(".compare-controls select");
+  cohortFilter.value = "no-such-provenance-cohort";
+  cohortFilter.dispatchEvent(new Event("input"));
+  assert.equal(cohortSelect.disabled, true);
+  assert.ok(document.querySelector(".cohort-summary").textContent.includes("No comparable"));
+  cohortFilter.value = "";
+  cohortFilter.dispatchEvent(new Event("input"));
+  assert.equal(cohortSelect.disabled, false);
+  const inspectButton = document.querySelector(".inspect-button");
+  if (inspectButton) {
+    inspectButton.click();
+    assert.equal(viewer.state.mode, "explore");
+    assert.equal(document.getElementById("explore-view").hidden, false);
+  }
+}

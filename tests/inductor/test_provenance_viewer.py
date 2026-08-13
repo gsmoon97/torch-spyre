@@ -31,6 +31,7 @@ from torch_spyre.provenance import (
     load_provenance_document,
     ProvenanceReaderError,
 )
+from torch_spyre.provenance_compare import build_compile_comparison
 from torch_spyre.provenance_viewer import (
     build_provenance_presentation,
     render_provenance_html,
@@ -282,6 +283,90 @@ class TestPresentationModel:
                 )
         first_binding = panels["opspec"]["rows"][0]
         assert first_binding["refs"]["handleIds"] == ["101", "102", "200"]
+
+    def test_synthetic_source_cohort_preserves_one_three_one_bundles(self):
+        source = {
+            "file": "/workspace/model.py",
+            "start_line": 17,
+            "start_col": 0,
+            "end_line": None,
+            "end_col": None,
+        }
+        handle = {
+            "source": source,
+            "aten_op": "aten.add.Tensor",
+            "ir_chain": ["shared_post"],
+            "fused_from": [],
+        }
+        document = {
+            "handles": {"handle": handle},
+            "kernelIdentities": {
+                identity_key: {
+                    "directHandleIds": ["handle"],
+                    "specHandleBindings": [{"handleId": "handle", "specPath": [0]}],
+                }
+                for identity_key in ("a", "b", "c", "d", "e")
+            },
+            "kernelOccurrences": {
+                identity_key: {
+                    "compileId": compile_id,
+                    "identityKey": identity_key,
+                    "registrations": [{"alias": "alias"}],
+                }
+                for compile_id, identity_key in (
+                    ("compile-a", "a"),
+                    ("compile-b", "b"),
+                    ("compile-b", "c"),
+                    ("compile-b", "d"),
+                    ("compile-c", "e"),
+                )
+            },
+            "upstreamProjections": {
+                compile_id: {"cppCodeToPost": {"alias": ["shared_post"]}}
+                for compile_id in ("compile-a", "compile-b", "compile-c")
+            },
+        }
+        events = [
+            {"identityKey": identity_key, "observations": []}
+            for identity_key in ("a", "b", "c", "d", "e")
+        ]
+
+        comparison = build_compile_comparison(document, events)
+
+        cohort = next(
+            item for item in comparison["cohorts"] if item["basis"] == "exact-handle"
+        )
+        assert cohort["bundleCountPattern"] == [1, 3, 1]
+        assert [group["memberCount"] for group in cohort["groups"]] == [1, 3, 1]
+        assert [len(group["bundles"]) for group in cohort["groups"]] == [1, 3, 1]
+
+    def test_generic_compile_comparison_is_opt_in_and_exact_first(self):
+        base = build_provenance_presentation(_SIDECAR)
+        compared = build_provenance_presentation(
+            _SIDECAR,
+            compare_compiles=True,
+        )
+
+        assert "comparisonAnalysis" not in base
+        assert compared["presentationVersion"] == 2
+        comparison = compared["comparisonAnalysis"]
+        assert comparison["comparisonKind"] == "compile-variants"
+        assert comparison["ordering"] == "stable-compile-id"
+        assert comparison["groupOrder"] == sorted(comparison["groupOrder"])
+        assert [group["bundleIdentityCount"] for group in comparison["groups"]] == [
+            2,
+            1,
+        ]
+        assert all(group["ordinal"] is None for group in comparison["groups"])
+        assert comparison["cohorts"]
+        exact = next(
+            cohort
+            for cohort in comparison["cohorts"]
+            if cohort["basis"] == "exact-handle"
+            and cohort["bundleCountPattern"] == [1, 1]
+        )
+        assert exact["hasCollision"] is False
+        assert [group["memberCount"] for group in exact["groups"]] == [2, 2]
 
     def test_sidecar_only_mode_is_deterministic(self):
         first = build_provenance_presentation(_SIDECAR)
@@ -535,6 +620,8 @@ class TestHtmlAndCli:
         )
         assert help_result.returncode == 0
         assert "--kineto-trace" in help_result.stdout
+        assert "--phase-adapter" in help_result.stdout
+        assert "--compare-compiles" in help_result.stdout
         assert "--compiler-artifacts" not in help_result.stdout
 
     def test_dom_interaction_gate(self, tmp_path):
@@ -585,3 +672,20 @@ class TestHtmlAndCli:
 
         assert completed.returncode == 0, completed.stderr
         assert "Spyre provenance viewer DOM check passed" in completed.stdout
+
+        comparison_output = tmp_path / "comparison.html"
+        write_provenance_html(
+            build_provenance_presentation(
+                _SIDECAR,
+                kineto_trace=trace,
+                compare_compiles=True,
+            ),
+            comparison_output,
+        )
+        comparison_completed = subprocess.run(
+            [node, str(_DOM_CHECK), str(comparison_output)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert comparison_completed.returncode == 0, comparison_completed.stderr

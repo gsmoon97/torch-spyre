@@ -38,9 +38,12 @@ from torch_spyre.provenance_codec import (
     KERNEL_PROVENANCE_KEY_BASE32_WIDTH,
     parse_kernel_provenance_event_name,
 )
+from torch_spyre.provenance_compare import build_compile_comparison
+from torch_spyre.provenance_phase import build_phase_analysis
 
 
 _PRESENTATION_VERSION = 1
+_COMPARISON_PRESENTATION_VERSION = 2
 _MAX_SIDECAR_BYTES = 256 * 1024 * 1024
 _MAX_KINETO_TRACE_BYTES = 256 * 1024 * 1024
 _MAX_PANEL_ROWS = 10_000
@@ -62,8 +65,15 @@ def build_provenance_presentation(
     sidecar_path: str | Path,
     *,
     kineto_trace: str | Path | None = None,
+    compare_compiles: bool = False,
+    phase_adapter: str | None = None,
 ) -> dict[str, Any]:
     """Build the deterministic presentation consumed by the offline page."""
+    if phase_adapter not in (None, "granite"):
+        raise _InputError(
+            "unsupported-phase-adapter",
+            f"unsupported phase adapter: {phase_adapter}",
+        )
     sidecar = Path(sidecar_path)
     _check_size(sidecar, _MAX_SIDECAR_BYTES, "sidecar")
     document = load_provenance_document(sidecar)
@@ -120,17 +130,50 @@ def build_provenance_presentation(
         events_by_key[identity_key] = event
     events.sort(key=lambda item: item["baseName"])
 
-    trace_input, unresolved = _load_kineto_trace(
+    trace_input, unresolved, trace_events = _load_kineto_trace(
         kineto_trace,
         document["kernelIdentities"],
         events_by_key,
         diagnostics,
     )
+    phase_analysis = None
+    if phase_adapter is not None:
+        if trace_input["status"] != "available":
+            diagnostics.append(
+                _diagnostic(
+                    "phase-trace-unavailable",
+                    "warning",
+                    "phase analysis requires an available Kineto trace",
+                    {"adapter": phase_adapter},
+                )
+            )
+        observation_records = [
+            (event["identityKey"], observation)
+            for event in events
+            for observation in event["observations"]
+        ]
+        phase_analysis, phase_diagnostics = build_phase_analysis(
+            trace_events,
+            observation_records,
+            phase_adapter,
+        )
+        diagnostics.extend(phase_diagnostics)
     observation_summary = _bound_runtime_occurrences(events, diagnostics)
+    comparison_analysis = None
+    if compare_compiles or phase_adapter is not None:
+        comparison_analysis = build_compile_comparison(
+            document,
+            events,
+            phase_analysis,
+        )
 
     diagnostics = _sorted_diagnostics(diagnostics)
     presentation = {
-        "presentationVersion": _PRESENTATION_VERSION,
+        "presentationVersion": (
+            _COMPARISON_PRESENTATION_VERSION
+            if comparison_analysis is not None
+            else _PRESENTATION_VERSION
+        ),
         "status": _status_from_diagnostics(diagnostics),
         "runSummary": {
             "resolvedObservations": observation_summary["total"],
@@ -147,6 +190,10 @@ def build_provenance_presentation(
         },
         "diagnostics": diagnostics,
     }
+    if phase_analysis is not None:
+        presentation["phaseAnalysis"] = phase_analysis
+    if comparison_analysis is not None:
+        presentation["comparisonAnalysis"] = comparison_analysis
     return cast(dict[str, Any], _sorted_json_value(presentation))
 
 
@@ -656,21 +703,25 @@ def _load_kineto_trace(
     identities: Mapping[str, Mapping[str, Any]],
     events_by_key: Mapping[str, dict[str, Any]],
     diagnostics: list[dict[str, Any]],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[object]]:
     if trace_path is None:
-        return _omitted_input(), []
+        return _omitted_input(), [], []
     path = Path(trace_path)
     try:
         value = _read_json_with_limit(path, _MAX_KINETO_TRACE_BYTES, "Kineto trace")
     except _InputError as error:
         diagnostics.append(_diagnostic(error.code, "warning", str(error)))
-        return {
-            "status": "unavailable",
-            "path": str(path.resolve()),
-            "sizeBytes": _safe_size(path),
-            "sha256": None,
-            "pairing": None,
-        }, []
+        return (
+            {
+                "status": "unavailable",
+                "path": str(path.resolve()),
+                "sizeBytes": _safe_size(path),
+                "sha256": None,
+                "pairing": None,
+            },
+            [],
+            [],
+        )
 
     trace_events = value.get("traceEvents") if isinstance(value, dict) else None
     if not isinstance(trace_events, list):
@@ -681,11 +732,15 @@ def _load_kineto_trace(
                 "Kineto trace must contain a traceEvents array",
             )
         )
-        return {
-            "status": "unavailable",
-            **_file_facts(path),
-            "pairing": None,
-        }, []
+        return (
+            {
+                "status": "unavailable",
+                **_file_facts(path),
+                "pairing": None,
+            },
+            [],
+            [],
+        )
 
     candidate_count = 0
     resolved_count = 0
@@ -830,19 +885,23 @@ def _load_kineto_trace(
             )
         )
     pairing_status = "complete" if not unresolved else "error"
-    return {
-        "status": "available",
-        **_file_facts(path),
-        "pairing": {
-            "status": pairing_status,
-            "candidateObservations": candidate_count,
-            "resolvedObservations": resolved_count,
-            "unresolvedObservations": len(unresolved),
-            "resolutionRate": (
-                resolved_count / candidate_count if candidate_count else None
-            ),
+    return (
+        {
+            "status": "available",
+            **_file_facts(path),
+            "pairing": {
+                "status": pairing_status,
+                "candidateObservations": candidate_count,
+                "resolvedObservations": resolved_count,
+                "unresolvedObservations": len(unresolved),
+                "resolutionRate": (
+                    resolved_count / candidate_count if candidate_count else None
+                ),
+            },
         },
-    }, unresolved
+        unresolved,
+        trace_events,
+    )
 
 
 def _native_handle_ids(
@@ -1045,6 +1104,8 @@ def render_provenance_html(presentation: Mapping[str, Any]) -> str:
         '<p id="run-summary"></p>\n'
         "</header>\n"
         "<main>\n"
+        '<div id="mode-root"></div>\n'
+        '<section id="explore-view">\n'
         '<section class="controls" aria-label="Provenance selection">\n'
         '<label>Profiler event<select id="event-select"></select></label>\n'
         '<label>Runtime occurrence<select id="observation-select"></select></label>\n'
@@ -1059,6 +1120,8 @@ def render_provenance_html(presentation: Mapping[str, Any]) -> str:
         '<strong id="fact-candidates"></strong></div>\n'
         "</section>\n"
         '<section id="panels" class="panels" aria-label="Provenance evidence"></section>\n'
+        "</section>\n"
+        '<section id="compare-view" hidden></section>\n'
         "</main>\n"
         '<script id="spyre-provenance-data" type="application/json">'
         + encoded
@@ -1155,7 +1218,7 @@ main { padding: 1rem 1.5rem 2rem; }
   font-weight: 600;
   gap: .35rem;
 }
-select {
+select, input {
   background: var(--layer);
   border: 1px solid var(--border);
   color: var(--text);
@@ -1289,6 +1352,76 @@ select:focus-visible, .evidence-row:focus-visible {
   font-style: italic;
   padding: .75rem;
 }
+.mode-switch {
+  background: var(--layer);
+  display: flex;
+  gap: .5rem;
+  margin-bottom: 1px;
+  padding: .75rem 1rem;
+}
+.mode-button, .inspect-button {
+  background: var(--layer);
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  min-height: 2.5rem;
+  padding: .5rem .8rem;
+}
+.mode-button[aria-pressed="true"] {
+  background: var(--selection);
+  border-color: var(--selection-border);
+  font-weight: 600;
+}
+.mode-button:focus-visible, .inspect-button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.compare-intro {
+  background: var(--layer);
+  padding: 1rem;
+}
+.compare-intro h2 { font-size: 1.3rem; margin: 0 0 .35rem; }
+.compare-intro p { color: var(--muted); margin: .25rem 0 0; }
+.compare-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cohort-summary {
+  background: var(--layer);
+  border-top: 1px solid var(--border);
+  padding: .75rem 1rem;
+}
+.cohort-summary strong { overflow-wrap: anywhere; }
+.run-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 1rem;
+}
+.run-card {
+  background: var(--layer);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+.run-header { border-bottom: 1px solid var(--border); padding: .85rem; }
+.run-header h3 { font-size: 1.1rem; margin: 0; }
+.run-annotation { color: var(--muted); margin: .25rem 0 0; }
+.run-metrics {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.run-metric { background: var(--layer); padding: .65rem; }
+.run-metric span {
+  color: var(--muted);
+  display: block;
+  font-size: .8rem;
+  font-weight: 600;
+}
+.run-metric strong { display: block; margin-top: .2rem; overflow-wrap: anywhere; }
+.cohort-result { border-top: 1px solid var(--border); padding: .85rem; }
+.cohort-result h4 { margin: 0 0 .35rem; }
+.bundle-list { display: grid; gap: .5rem; margin-top: .75rem; }
+.inspect-button { text-align: left; width: 100%; }
+.inspect-button span { color: var(--muted); display: block; font-size: .82rem; }
 @media (max-width: 78rem) {
   .panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -1317,7 +1450,11 @@ const elements = {
   factDuration: document.getElementById("fact-duration"),
   factStep: document.getElementById("fact-step"),
   factCandidates: document.getElementById("fact-candidates"),
+  modeRoot: document.getElementById("mode-root"),
+  exploreView: document.getElementById("explore-view"),
+  compareView: document.getElementById("compare-view"),
 };
+const comparison = data.comparisonAnalysis || null;
 const relationFields = [
   "compileAliases",
   "handleIds",
@@ -1325,8 +1462,10 @@ const relationFields = [
   "preNodes",
 ];
 const state = {
+  mode: "explore",
   eventIndex: 0,
   observationIndex: 0,
+  cohortIndex: 0,
   focusedPanelId: null,
   focusedRowId: null,
   rowById: new Map(),
@@ -1570,10 +1709,228 @@ function selectEvent(index) {
   state.observationIndex = 0;
   state.focusedPanelId = null;
   state.focusedRowId = null;
+  elements.eventSelect.value = String(index);
   populateObservations();
   renderFacts();
   renderPanels();
   updateFocusClasses();
+}
+
+function metric(label, value) {
+  const item = node("div", "run-metric");
+  item.append(node("span", "", label), node("strong", "", display(value)));
+  return item;
+}
+
+function showMode(mode) {
+  state.mode = mode;
+  elements.exploreView.hidden = mode !== "explore";
+  elements.compareView.hidden = mode !== "compare";
+  if (elements.exploreModeButton) {
+    elements.exploreModeButton.setAttribute(
+      "aria-pressed", mode === "explore" ? "true" : "false"
+    );
+    elements.compareModeButton.setAttribute(
+      "aria-pressed", mode === "compare" ? "true" : "false"
+    );
+  }
+}
+
+function inspectBundle(bundle) {
+  const eventIndex = data.events.findIndex(
+    (event) => event.identityKey === bundle.identityKey
+  );
+  if (eventIndex < 0) {
+    return;
+  }
+  selectEvent(eventIndex);
+  const event = currentEvent();
+  const observationIndex = event.observations.findIndex(
+    (observation) => bundle.traceEventIndices.includes(observation.traceEventIndex)
+  );
+  if (observationIndex >= 0) {
+    state.observationIndex = observationIndex;
+    populateObservations();
+    renderFacts();
+  }
+  showMode("explore");
+}
+
+function renderComparison() {
+  const cohort = comparison.cohorts[state.cohortIndex] || null;
+  elements.runGrid.replaceChildren();
+  if (!cohort) {
+    elements.cohortSummary.replaceChildren(
+      node("strong", "", "No comparable source cohorts were derived."),
+      node("p", "", "Use runtime-event exploration for available evidence.")
+    );
+    return;
+  }
+  elements.cohortSelect.value = String(state.cohortIndex);
+  const basis = cohort.basis === "candidate"
+    ? "Matched by structured source, ATen identity, and one exact post-grad origin."
+    : "Kept by exact debug-handle identity; a safe operation candidate is unavailable.";
+  elements.cohortSummary.replaceChildren(
+    node("strong", "", cohort.label),
+    node(
+      "p",
+      "",
+      basis + " Bundle pattern: " + cohort.bundleCountPattern.join(" / ") + "."
+    )
+  );
+  comparison.groups.forEach((group, index) => {
+    const selected = cohort.groups[index];
+    const card = node("section", "run-card");
+    card.dataset.compileId = group.compileId;
+    const header = node("div", "run-header");
+    header.append(
+      node("h3", "", group.label),
+      node(
+        "p",
+        "run-annotation",
+        (group.annotation ? group.annotation + " | " : "") +
+          "compile " + group.compileId.slice(0, 12)
+      )
+    );
+    const totals = node("div", "run-metrics");
+    totals.append(
+      metric("All bundles", group.bundleIdentityCount),
+      metric("Runtime observations", group.observationCount),
+      metric("Bundle + JobPlan steps", group.identityStepGroupCount)
+    );
+    const result = node("div", "cohort-result");
+    result.append(node("h4", "", "Selected source cohort"));
+    result.append(
+      node(
+        "p",
+        "",
+        selected.bundleCount + " bundle" +
+          (selected.bundleCount === 1 ? "" : "s") + " | " +
+          selected.memberCount + " operation member" +
+          (selected.memberCount === 1 ? "" : "s") + " | " +
+          selected.observationCount + " runtime observation" +
+          (selected.observationCount === 1 ? "" : "s")
+      )
+    );
+    if (selected.collision) {
+      result.append(
+        badge("multiple handles share this candidate", "badge-ambiguous")
+      );
+    }
+    const bundles = node("div", "bundle-list");
+    selected.bundles.forEach((bundle) => {
+      const button = node("button", "inspect-button");
+      button.type = "button";
+      button.append(
+        node("strong", "", "Inspect bundle " + bundle.identityKey),
+        node(
+          "span",
+          "",
+          bundle.memberCount + " members | " +
+            bundle.traceEventIndices.length + " runtime observations"
+        )
+      );
+      button.addEventListener("click", () => inspectBundle(bundle));
+      bundles.append(button);
+    });
+    if (!selected.bundles.length) {
+      bundles.append(node("p", "empty-state", "Cohort absent from this run."));
+    }
+    result.append(bundles);
+    card.append(header, totals, result);
+    elements.runGrid.append(card);
+  });
+}
+
+function populateCohortOptions(query) {
+  const normalized = query.trim().toLowerCase();
+  elements.cohortSelect.replaceChildren();
+  const matches = [];
+  comparison.cohorts.forEach((cohort, index) => {
+    const pattern = cohort.bundleCountPattern.join(" / ");
+    const searchable = (
+      cohort.label + " " + cohort.basis + " " + pattern
+    ).toLowerCase();
+    if (normalized && !searchable.includes(normalized)) {
+      return;
+    }
+    const option = node(
+      "option",
+      "",
+      cohort.label + " | " + pattern + " bundles | " + cohort.basis
+    );
+    option.value = String(index);
+    elements.cohortSelect.append(option);
+    matches.push(index);
+  });
+  if (!matches.includes(state.cohortIndex)) {
+    state.cohortIndex = matches.length ? matches[0] : -1;
+  }
+  elements.cohortSelect.disabled = matches.length === 0;
+  if (state.cohortIndex >= 0) {
+    elements.cohortSelect.value = String(state.cohortIndex);
+  }
+}
+
+function setupComparison() {
+  if (!comparison) {
+    return;
+  }
+  const nav = node("nav", "mode-switch");
+  nav.setAttribute("aria-label", "Viewer mode");
+  elements.exploreModeButton = node(
+    "button", "mode-button", "Explore runtime event"
+  );
+  elements.compareModeButton = node(
+    "button", "mode-button", "Compare compile variants"
+  );
+  elements.exploreModeButton.type = "button";
+  elements.compareModeButton.type = "button";
+  elements.exploreModeButton.addEventListener("click", () => showMode("explore"));
+  elements.compareModeButton.addEventListener("click", () => showMode("compare"));
+  nav.append(elements.exploreModeButton, elements.compareModeButton);
+  elements.modeRoot.append(nav);
+
+  const intro = node("section", "compare-intro");
+  intro.append(
+    node("h2", "", "Compare a source cohort across compile variants"),
+    node(
+      "p",
+      "",
+      "Each column is one finalized wrapper-content identity. Workload names such as " +
+        "prefill or decode are optional trace-derived annotations."
+    )
+  );
+  const controls = node("section", "controls compare-controls");
+  const searchLabel = node("label", "", "Filter source cohorts");
+  elements.cohortFilter = node("input");
+  elements.cohortFilter.type = "search";
+  elements.cohortFilter.placeholder = "Source file, ATen op, FX node, or pattern";
+  searchLabel.append(elements.cohortFilter);
+  const label = node("label", "", "Source cohort");
+  elements.cohortSelect = node("select");
+  elements.cohortFilter.addEventListener("input", () => {
+    populateCohortOptions(elements.cohortFilter.value);
+    renderComparison();
+  });
+  elements.cohortSelect.addEventListener("change", () => {
+    state.cohortIndex = Number(elements.cohortSelect.value);
+    renderComparison();
+  });
+  label.append(elements.cohortSelect);
+  controls.append(searchLabel, label);
+  elements.cohortSummary = node("section", "cohort-summary");
+  elements.runGrid = node("section", "run-grid");
+  elements.runGrid.setAttribute("aria-label", "Compile variant comparison");
+  elements.compareView.append(
+    intro,
+    controls,
+    elements.cohortSummary,
+    elements.runGrid
+  );
+  populateCohortOptions("");
+  renderComparison();
+  showMode("compare");
 }
 
 elements.eventSelect.addEventListener("change", () => {
@@ -1603,11 +1960,14 @@ if (pairing && pairing.resolutionRate !== null) {
 elements.runSummary.textContent = summaryParts.join(" | ");
 populateEvents();
 selectEvent(0);
+setupComparison();
 window.__spyreProvenanceViewer = {
   data,
   state,
   rowsRelated,
   selectEvent,
+  showMode,
+  renderComparison,
 };
 """.strip()
 
@@ -1628,6 +1988,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--kineto-trace",
         help="optional Kineto Chrome trace containing runtime occurrences",
     )
+    parser.add_argument(
+        "--phase-adapter",
+        choices=("granite",),
+        help="optional workload adapter that annotates generic compile variants",
+    )
+    parser.add_argument(
+        "--compare-compiles",
+        action="store_true",
+        help="compare source cohorts across compile variants",
+    )
     parser.add_argument("--output", required=True, help="output HTML path")
     args = parser.parse_args(argv)
 
@@ -1635,6 +2005,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         presentation = build_provenance_presentation(
             args.sidecar,
             kineto_trace=args.kineto_trace,
+            compare_compiles=args.compare_compiles,
+            phase_adapter=args.phase_adapter,
         )
     except (ProvenanceReaderError, _InputError) as error:
         code = getattr(error, "code", "viewer-input-failure")
