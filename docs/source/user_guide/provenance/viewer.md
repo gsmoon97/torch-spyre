@@ -273,10 +273,17 @@ or command-to-OpSpec relationships. Provenance can identify a recorded
 divergence boundary, but it cannot explain a fusion or split decision that no
 producer recorded.
 
-The sidecar and optional trace are each bounded to 256 MiB. Optional trace
-failures leave the validated sidecar view available with diagnostics. Invalid
-or unsupported sidecars fail generation because showing unvalidated
-attribution would be misleading.
+The sidecar and optional trace are each bounded to 256 MiB. Each panel displays
+at most 10,000 deterministically ordered evidence rows, and the export retains
+at most the earliest 10,000 resolved runtime occurrences by trace-event index.
+Panel headers and the run summary show displayed and total counts when either
+limit is reached. The presentation becomes ``partial`` and records explicit
+truncation diagnostics; the validated sidecar and trace remain the complete
+evidence sources.
+
+Optional trace failures leave the validated sidecar view available with
+diagnostics. Invalid or unsupported sidecars fail generation because showing
+unvalidated attribution would be misleading.
 
 The export can reveal file paths, line numbers, operation names, and compiler
 structure. Review it before sharing.

@@ -292,6 +292,8 @@ class TestPresentationModel:
         assert first["inputs"]["kinetoTrace"]["status"] == "omitted"
         assert first["runSummary"] == {
             "resolvedObservations": 0,
+            "displayedObservations": 0,
+            "omittedResolvedObservations": 0,
             "unresolvedObservations": 0,
         }
 
@@ -302,6 +304,32 @@ class TestPresentationModel:
             build_provenance_presentation(_SIDECAR)
 
         assert error.value.code == "input-size-limit"
+
+    def test_panel_rows_are_deterministically_capped(self, monkeypatch):
+        monkeypatch.setattr(viewer, "_MAX_PANEL_ROWS", 1)
+
+        presentation = build_provenance_presentation(_SIDECAR)
+        panels = _panels(presentation)
+
+        assert presentation["status"] == "partial"
+        assert panels["source"]["totalRowCount"] == 2
+        assert panels["source"]["displayedRowCount"] == 1
+        assert panels["source"]["omittedRowCount"] == 1
+        assert panels["source"]["rows"][0]["label"] == ("/workspace/model.py:17:0")
+        assert "showing 1 of 2 rows" in panels["source"]["summary"]
+        diagnostics = [
+            item
+            for item in presentation["diagnostics"]
+            if item["code"] == "panel-rows-truncated"
+        ]
+        assert {item["details"]["panelId"] for item in diagnostics} == {
+            "source",
+            "aten",
+            "pre-grad",
+            "post-grad",
+            "lower-ir",
+            "opspec",
+        }
 
 
 class TestKinetoPairing:
@@ -386,6 +414,44 @@ class TestKinetoPairing:
         }
         assert _identity(presentation)["directHandleIds"] == ["200"]
 
+    def test_runtime_occurrences_are_deterministically_capped(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr(viewer, "_MAX_RUNTIME_OCCURRENCES", 1)
+        trace = tmp_path / "trace.json"
+        _write_trace(trace)
+
+        presentation = build_provenance_presentation(
+            _SIDECAR,
+            kineto_trace=trace,
+        )
+
+        event = next(
+            item
+            for item in presentation["events"]
+            if item["identityKey"] == _IDENTITY_KEY
+        )
+        assert [item["traceEventIndex"] for item in event["observations"]] == [0]
+        assert event["observationCount"] == 2
+        assert event["displayedObservationCount"] == 1
+        assert event["omittedObservationCount"] == 1
+        assert presentation["runSummary"] == {
+            "resolvedObservations": 2,
+            "displayedObservations": 1,
+            "omittedResolvedObservations": 1,
+            "unresolvedObservations": 0,
+        }
+        assert (
+            presentation["inputs"]["kinetoTrace"]["pairing"]["resolvedObservations"]
+            == 2
+        )
+        assert "runtime-occurrences-truncated" in {
+            item["code"] for item in presentation["diagnostics"]
+        }
+        assert presentation["status"] == "partial"
+
 
 class TestHtmlAndCli:
     def test_html_contains_only_viewer_interface(self):
@@ -410,13 +476,23 @@ class TestHtmlAndCli:
     def test_json_payload_is_script_safe(self):
         presentation = build_provenance_presentation(_SIDECAR)
         presentation["diagnostics"].append(
-            {"code": "test", "severity": "warning", "message": "</script>&"}
+            {
+                "code": "test",
+                "severity": "warning",
+                "message": "</script>&<!--\u2028",
+            }
         )
 
         html = render_provenance_html(presentation)
 
-        assert "</script>&" not in html
-        assert "\\u003c/script\\u003e\\u0026" in html
+        assert "</script>&<!--\u2028" not in html
+        assert "\\u003c/script\\u003e\\u0026\\u003c!--\\u2028" in html
+        assert "innerHTML" not in html
+        assert "document.write" not in html
+        assert "eval(" not in html
+        assert "<script src=" not in html
+        assert "<link " not in html
+        assert "url(" not in html
 
     def test_atomic_writer_replaces_output(self, tmp_path):
         output = tmp_path / "viewer.html"
