@@ -43,6 +43,8 @@ from torch_spyre.provenance_codec import (
 _PRESENTATION_VERSION = 1
 _MAX_SIDECAR_BYTES = 256 * 1024 * 1024
 _MAX_KINETO_TRACE_BYTES = 256 * 1024 * 1024
+_MAX_PANEL_ROWS = 10_000
+_MAX_RUNTIME_OCCURRENCES = 10_000
 _HASH_CHUNK_BYTES = 1024 * 1024
 _NATIVE_KEY_RE = regex.compile(rf"\A[a-z2-7]{{{KERNEL_PROVENANCE_KEY_BASE32_WIDTH}}}\Z")
 _RELATION_FIELDS = ("compileAliases", "handleIds", "postNodes", "preNodes")
@@ -106,6 +108,7 @@ def build_provenance_presentation(
             occurrences,
             document["handles"],
             document["upstreamProjections"],
+            diagnostics,
         )
         identities[identity_key] = normalized
         event = {
@@ -123,15 +126,16 @@ def build_provenance_presentation(
         events_by_key,
         diagnostics,
     )
-    for event in events:
-        event["observations"].sort(key=lambda item: item["traceEventIndex"])
+    observation_summary = _bound_runtime_occurrences(events, diagnostics)
 
     diagnostics = _sorted_diagnostics(diagnostics)
     presentation = {
         "presentationVersion": _PRESENTATION_VERSION,
         "status": _status_from_diagnostics(diagnostics),
         "runSummary": {
-            "resolvedObservations": sum(len(event["observations"]) for event in events),
+            "resolvedObservations": observation_summary["total"],
+            "displayedObservations": observation_summary["displayed"],
+            "omittedResolvedObservations": observation_summary["omitted"],
             "unresolvedObservations": len(unresolved),
         },
         "events": events,
@@ -152,6 +156,7 @@ def _identity_presentation(
     occurrences: Sequence[Mapping[str, Any]],
     all_handles: Mapping[str, Mapping[str, Any]],
     projections: Mapping[str, Mapping[str, Any]],
+    diagnostics: list[dict[str, Any]],
 ) -> dict[str, Any]:
     direct_ids = list(identity["directHandleIds"])
     handle_ids = _reachable_handle_ids(direct_ids, all_handles)
@@ -265,6 +270,23 @@ def _identity_presentation(
             "No direct OpSpec bindings were recorded.",
         ),
     ]
+    for panel in panels:
+        if panel["omittedRowCount"]:
+            diagnostics.append(
+                _diagnostic(
+                    "panel-rows-truncated",
+                    "warning",
+                    "panel rows exceed the offline viewer limit",
+                    {
+                        "identityKey": identity_key,
+                        "panelId": panel["id"],
+                        "rowLimit": _MAX_PANEL_ROWS,
+                        "totalRows": panel["totalRowCount"],
+                        "displayedRows": panel["displayedRowCount"],
+                        "omittedRows": panel["omittedRowCount"],
+                    },
+                )
+            )
     return {
         "identityKey": identity_key,
         "eventNameBase": identity["eventNameBase"],
@@ -515,6 +537,13 @@ def _panel(
     empty_message: str,
     scope_details: Sequence[str] = (),
 ) -> dict[str, Any]:
+    all_rows = list(rows)
+    total_row_count = len(all_rows)
+    displayed_rows = all_rows[:_MAX_PANEL_ROWS]
+    displayed_row_count = len(displayed_rows)
+    omitted_row_count = total_row_count - displayed_row_count
+    if omitted_row_count:
+        summary += f" | showing {displayed_row_count} of {total_row_count} rows"
     return {
         "id": panel_id,
         "title": title,
@@ -522,7 +551,10 @@ def _panel(
         "summary": summary,
         "scopeDetails": list(scope_details),
         "emptyMessage": empty_message,
-        "rows": copy.deepcopy(list(rows)),
+        "totalRowCount": total_row_count,
+        "displayedRowCount": displayed_row_count,
+        "omittedRowCount": omitted_row_count,
+        "rows": copy.deepcopy(displayed_rows),
     }
 
 
@@ -565,6 +597,60 @@ def _reachable_handle_ids(
     return ordered
 
 
+def _bound_runtime_occurrences(
+    events: Sequence[dict[str, Any]],
+    diagnostics: list[dict[str, Any]],
+) -> dict[str, int]:
+    ordered: list[tuple[int, dict[str, Any]]] = []
+    for event in events:
+        event["observations"].sort(key=lambda item: item["traceEventIndex"])
+        event["observationCount"] = len(event["observations"])
+        ordered.extend(
+            (observation["traceEventIndex"], observation)
+            for observation in event["observations"]
+        )
+    ordered.sort(key=lambda item: item[0])
+    retained_indices = {
+        trace_index for trace_index, _ in ordered[:_MAX_RUNTIME_OCCURRENCES]
+    }
+
+    displayed_count = 0
+    for event in events:
+        event["observations"] = [
+            observation
+            for observation in event["observations"]
+            if observation["traceEventIndex"] in retained_indices
+        ]
+        event["displayedObservationCount"] = len(event["observations"])
+        event["omittedObservationCount"] = (
+            event["observationCount"] - event["displayedObservationCount"]
+        )
+        displayed_count += event["displayedObservationCount"]
+
+    total_count = len(ordered)
+    omitted_count = total_count - displayed_count
+    if omitted_count:
+        diagnostics.append(
+            _diagnostic(
+                "runtime-occurrences-truncated",
+                "warning",
+                "runtime occurrences exceed the offline viewer limit",
+                {
+                    "occurrenceLimit": _MAX_RUNTIME_OCCURRENCES,
+                    "totalOccurrences": total_count,
+                    "displayedOccurrences": displayed_count,
+                    "omittedOccurrences": omitted_count,
+                    "retentionPolicy": "earliest-trace-event-index",
+                },
+            )
+        )
+    return {
+        "total": total_count,
+        "displayed": displayed_count,
+        "omitted": omitted_count,
+    }
+
+
 def _load_kineto_trace(
     trace_path: str | Path | None,
     identities: Mapping[str, Mapping[str, Any]],
@@ -575,7 +661,7 @@ def _load_kineto_trace(
         return _omitted_input(), []
     path = Path(trace_path)
     try:
-        value = _read_json_bounded(path, _MAX_KINETO_TRACE_BYTES, "Kineto trace")
+        value = _read_json_with_limit(path, _MAX_KINETO_TRACE_BYTES, "Kineto trace")
     except _InputError as error:
         diagnostics.append(_diagnostic(error.code, "warning", str(error)))
         return {
@@ -824,7 +910,7 @@ def _nonnegative_number(value: object) -> int | float | None:
     return number if number is not None and number >= 0 else None
 
 
-def _read_json_bounded(path: Path, limit: int, label: str) -> object:
+def _read_json_with_limit(path: Path, limit: int, label: str) -> object:
     _check_size(path, limit, label)
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -1276,9 +1362,13 @@ function currentObservation() {
 }
 
 function eventLabel(event) {
-  const count = event.observations.length;
+  const total = event.observationCount;
+  const displayed = event.displayedObservationCount;
+  const count = total === displayed
+    ? String(total)
+    : "showing " + displayed + " of " + total;
   return event.baseName + " | " + count + " runtime occurrence" +
-    (count === 1 ? "" : "s");
+    (total === 1 ? "" : "s");
 }
 
 function observationLabel(observation) {
@@ -1495,8 +1585,13 @@ elements.observationSelect.addEventListener("change", () => {
 });
 
 const pairing = data.inputs.kinetoTrace.pairing;
+const resolved = data.runSummary.resolvedObservations;
+const displayed = data.runSummary.displayedObservations;
 const summaryParts = [
-  data.runSummary.resolvedObservations + " resolved runtime occurrences",
+  (resolved === displayed
+    ? resolved
+    : displayed + " of " + resolved + " shown") +
+    " resolved runtime occurrences",
 ];
 if (data.runSummary.unresolvedObservations) {
   summaryParts.push(data.runSummary.unresolvedObservations + " unresolved");
