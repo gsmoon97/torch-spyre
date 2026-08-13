@@ -143,6 +143,8 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch_spyre.provenance \
 Disabling backend autoload is required for this module command because Python
 initializes the `torch_spyre` package before executing the reader. The reader
 uses only the saved event and sidecar and does not import compiler internals.
+For linked visual inspection of all events, generate the self-contained
+[offline provenance viewer](../provenance/viewer.md).
 
 When several processes publish to the same configured sidecar path, cooperating
 writers hold an advisory file lock across the complete read-merge-write
