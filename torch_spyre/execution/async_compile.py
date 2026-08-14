@@ -83,6 +83,7 @@ def _check_ktir_device_prerequisites() -> None:
             + "\n".join(f"  - {m}" for m in missing)
         )
 
+
 _publication_disabled_lock = threading.Lock()
 _publication_disabled_logged = False
 _provenance_level_zero_lock = threading.Lock()
@@ -373,6 +374,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
     def wait(self, scope: dict[str, Any]) -> None:
         super().wait(scope)
+        # Later waits must not consume stale V.graph state or publish/count twice.
         if self._provenance_wait_completed:
             return
         self._provenance_wait_completed = True
