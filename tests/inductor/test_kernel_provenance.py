@@ -879,6 +879,10 @@ class TestProvenanceArtifactCollection:
         graph = _graph_lowering(wrapper_code=wrapper)
         scheduling = object.__new__(SuperDSCScheduling)
         node_schedule = [object()]
+        kernel = types.SimpleNamespace(
+            _kernel_uses_hbm_pool=lambda: False,
+            pool_size=0,
+        )
 
         with (
             V.set_graph_handler(graph),
@@ -895,9 +899,9 @@ class TestProvenanceArtifactCollection:
                 side_effect=(4, 9),
             ) as register,
         ):
-            first_name = scheduling.define_kernel("[]", node_schedule, object())
+            first_name = scheduling.define_kernel("[]", node_schedule, kernel)
             scheduling.codegen_comment(node_schedule, first_name)
-            second_name = scheduling.define_kernel("[]", node_schedule, object())
+            second_name = scheduling.define_kernel("[]", node_schedule, kernel)
             scheduling.codegen_comment(node_schedule, second_name)
 
         registrations = consume_kernel_registration_state(graph).registrations
