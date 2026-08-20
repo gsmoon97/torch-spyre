@@ -273,7 +273,7 @@ class SpyreAsyncCompile(AsyncCompile):
         ktir_text = generate_ktir(
             kernel_name,
             specs,
-            bake_addresses=not _spyre_config.bundle_symbolic_args,
+            bake_addresses=not spyre_config.bundle_symbolic_args,
         )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
